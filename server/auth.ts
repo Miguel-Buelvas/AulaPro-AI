@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import type { NextFunction, Request, Response } from 'express';
-import { db } from './db.ts';
+import { store } from './store.ts';
 
 export interface AuthUser {
   id: string;
@@ -41,20 +41,18 @@ function hashToken(token: string): string {
   return crypto.createHash('sha256').update(token).digest('hex');
 }
 
-export function createSession(userId: string): { token: string; expiresAt: string } {
+export async function createSession(userId: string): Promise<{ token: string; expiresAt: string }> {
   const token = crypto.randomBytes(32).toString('hex');
   const tokenHash = hashToken(token);
   const now = new Date();
   const expires = new Date(now.getTime() + SESSION_DAYS * 24 * 60 * 60 * 1000);
-  db.prepare(
-    'INSERT INTO sessions (token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)'
-  ).run(tokenHash, userId, expires.toISOString(), now.toISOString());
+  await store.createSession(tokenHash, userId, expires.toISOString(), now.toISOString());
   return { token, expiresAt: expires.toISOString() };
 }
 
-export function revokeSession(token: string): void {
+export async function revokeSession(token: string): Promise<void> {
   const tokenHash = hashToken(token);
-  db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash);
+  await store.deleteSession(tokenHash);
 }
 
 function parseCookies(cookieHeader: string | undefined): Record<string, string> {
@@ -116,37 +114,18 @@ export function getTokenFromRequest(req: Request): string | null {
   return cookies[SESSION_COOKIE_NAME] || null;
 }
 
-export function getUserFromToken(token: string | null): AuthUser | null {
+export async function getUserFromToken(token: string | null): Promise<AuthUser | null> {
   if (!token) return null;
   const tokenHash = hashToken(token);
-  const row = db
-    .prepare(
-      `SELECT u.id, u.email, u.name, u.phone, u.institution, u.education_level, u.program, u.role, u.created_at, s.expires_at
-       FROM sessions s
-       JOIN users u ON u.id = s.user_id
-       WHERE s.token_hash = ?`
-    )
-    .get(tokenHash) as
-    | {
-        id: string;
-        email: string;
-        name: string;
-        phone: string;
-        institution: string;
-        education_level: string;
-        program: string;
-        role: 'student' | 'admin';
-        created_at: string;
-        expires_at: string;
-      }
-    | undefined;
+  const sessionData = await store.getSessionWithUser(tokenHash);
+  if (!sessionData) return null;
 
-  if (!row) return null;
-  if (new Date(row.expires_at).getTime() < Date.now()) {
-    db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash);
+  if (new Date(sessionData.expires_at).getTime() < Date.now()) {
+    await store.deleteSession(tokenHash);
     return null;
   }
 
+  const row = sessionData.user;
   return {
     id: row.id,
     email: row.email,
@@ -184,19 +163,23 @@ export function csrfGuard(req: Request, res: Response, next: NextFunction): void
   next();
 }
 
-export function requireAuth(req: AuthedRequest, res: Response, next: NextFunction): void {
-  const token = getTokenFromRequest(req);
-  const user = getUserFromToken(token);
-  if (!user) {
-    res.status(401).json({ error: 'Debes iniciar sesión para continuar.' });
-    return;
+export async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const token = getTokenFromRequest(req);
+    const user = await getUserFromToken(token);
+    if (!user) {
+      res.status(401).json({ error: 'Debes iniciar sesión para continuar.' });
+      return;
+    }
+    req.user = user;
+    next();
+  } catch (err) {
+    next(err);
   }
-  req.user = user;
-  next();
 }
 
-export function requireAdmin(req: AuthedRequest, res: Response, next: NextFunction): void {
-  requireAuth(req, res, () => {
+export async function requireAdmin(req: AuthedRequest, res: Response, next: NextFunction): Promise<void> {
+  await requireAuth(req, res, () => {
     if (!req.user || req.user.role !== 'admin') {
       res.status(403).json({ error: 'Acceso restringido al administrador autorizado.' });
       return;
@@ -209,33 +192,34 @@ export function hasConfiguredEnvAdmin(): boolean {
   return Boolean(process.env.ADMIN_PASSWORD && process.env.ADMIN_PASSWORD.trim().length > 0);
 }
 
-export function hasStoredAdmin(): boolean {
-  const row = db.prepare("SELECT COUNT(*) as total FROM users WHERE role = 'admin'").get() as { total: number };
-  return row.total > 0;
+export async function hasStoredAdmin(): Promise<boolean> {
+  return store.hasStoredAdmin();
 }
 
-export function syncEnvAdminIfNeeded(): void {
+export async function syncEnvAdminIfNeeded(): Promise<void> {
   const envPass = process.env.ADMIN_PASSWORD?.trim();
   const envEmail = (process.env.ADMIN_EMAIL?.trim() || 'buelvasmiguel03@gmail.com').toLowerCase();
   if (!envPass) return;
 
-  const existingAdmin = db.prepare("SELECT id, email FROM users WHERE role = 'admin' LIMIT 1").get() as
-    | { id: string; email: string }
-    | undefined;
+  const existingAdmin = await store.getFirstAdmin();
   const now = new Date().toISOString();
   const passwordHash = hashPassword(envPass);
 
   if (existingAdmin) {
-    db.prepare('UPDATE users SET email = ?, password_hash = ?, updated_at = ? WHERE id = ?').run(
-      envEmail,
-      passwordHash,
-      now,
-      existingAdmin.id
-    );
+    await store.updateAdminCredentials(existingAdmin.id, envEmail, passwordHash, now);
   } else {
-    db.prepare(
-      `INSERT INTO users (id, email, name, phone, institution, education_level, program, role, password_hash, created_at, updated_at)
-       VALUES (?, ?, 'Administrador AulaPro AI', '', 'AulaPro AI', 'Administración', 'Dirección Académica', 'admin', ?, ?, ?)`
-    ).run(crypto.randomUUID(), envEmail, passwordHash, now, now);
+    await store.createUser({
+      id: crypto.randomUUID(),
+      email: envEmail,
+      name: 'Administrador AulaPro AI',
+      phone: '',
+      institution: 'AulaPro AI',
+      education_level: 'Administración',
+      program: 'Dirección Académica',
+      role: 'admin',
+      password_hash: passwordHash,
+      created_at: now,
+      updated_at: now,
+    });
   }
 }

@@ -1,6 +1,11 @@
-import { useState, type FormEvent } from 'react';
+import { useEffect, useState, type FormEvent } from 'react';
 import { ArrowLeft, Info, Lock, Moon, Shield, Sun } from 'lucide-react';
 import { apiFetch } from '../lib/api.ts';
+import {
+  exchangeSupabaseAccessToken,
+  getSupabaseBrowserClient,
+  type PublicSupabaseConfig,
+} from '../lib/supabase.ts';
 import type { UserProfile } from '../types.ts';
 import { BrandLogo } from './BrandLogo.tsx';
 import type { LegalDocType } from './LegalModal.tsx';
@@ -9,6 +14,7 @@ interface AuthViewProps {
   initialMode: 'login' | 'register' | 'admin-setup';
   adminNeedsSetup: boolean;
   googleAuthConfigured: boolean;
+  supabaseConfig: PublicSupabaseConfig | null;
   darkMode: boolean;
   onToggleDark: () => void;
   onBackHome: () => void;
@@ -20,6 +26,7 @@ export function AuthView({
   initialMode,
   adminNeedsSetup,
   googleAuthConfigured,
+  supabaseConfig,
   darkMode,
   onToggleDark,
   onBackHome,
@@ -41,8 +48,74 @@ export function AuthView({
   const [acceptedPolicies, setAcceptedPolicies] = useState(false);
 
   const [loading, setLoading] = useState(false);
+  const [googleLoading, setGoogleLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showGoogleNotice, setShowGoogleNotice] = useState(false);
+
+  useEffect(() => {
+    const onMessage = async (event: MessageEvent) => {
+      if (event.origin !== window.location.origin) return;
+      if (event.data?.type !== 'AULAPRO_SUPABASE_OAUTH' || !event.data?.accessToken) return;
+      setGoogleLoading(true);
+      setError(null);
+      try {
+        const user = await exchangeSupabaseAccessToken(String(event.data.accessToken));
+        onAuthenticated(user);
+      } catch (err) {
+        setError(
+          err instanceof Error ? err.message : 'No fue posible iniciar sesión con Google.'
+        );
+      } finally {
+        setGoogleLoading(false);
+      }
+    };
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, [onAuthenticated]);
+
+  const handleGoogleSignIn = async () => {
+    setError(null);
+    const supabase = getSupabaseBrowserClient(supabaseConfig);
+    if (!googleAuthConfigured || !supabase) {
+      setShowGoogleNotice((prev) => !prev);
+      return;
+    }
+
+    setGoogleLoading(true);
+    try {
+      const inIframe = window.self !== window.top;
+      if (inIframe) {
+        const { data, error: oauthErr } = await supabase.auth.signInWithOAuth({
+          provider: 'google',
+          options: {
+            redirectTo: window.location.origin,
+            skipBrowserRedirect: true,
+          },
+        });
+        if (oauthErr || !data?.url) {
+          throw new Error(oauthErr?.message || 'No fue posible abrir la ventana de Google.');
+        }
+        const popup = window.open(data.url, 'aulapro_google_oauth', 'width=520,height=660');
+        if (!popup) {
+          setGoogleLoading(false);
+          setError('Permite las ventanas emergentes en tu navegador para continuar con Google.');
+        }
+      } else {
+        const { error: oauthErr } = await supabase.auth.signInWithOAuth({
+          provider: 'google',
+          options: {
+            redirectTo: window.location.origin,
+          },
+        });
+        if (oauthErr) {
+          throw new Error(oauthErr.message);
+        }
+      }
+    } catch (err) {
+      setGoogleLoading(false);
+      setError(err instanceof Error ? err.message : 'No fue posible iniciar con Google.');
+    }
+  };
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
@@ -180,12 +253,13 @@ export function AuthView({
                   : 'Tu información y documentos estarán protegidos exclusivamente en tu cuenta.'}
               </p>
 
-              {/* Google Sign-In Button (Honest configuration state) */}
+              {/* Google Sign-In Button */}
               <div className="mt-5">
                 <button
                   type="button"
-                  onClick={() => setShowGoogleNotice((prev) => !prev)}
-                  className="w-full flex items-center justify-center gap-2.5 py-2.5 px-4 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#090F22] hover:bg-slate-50 dark:hover:bg-slate-800/70 text-sm font-medium text-[#0A1633] dark:text-white transition-colors"
+                  disabled={googleLoading}
+                  onClick={handleGoogleSignIn}
+                  className="w-full flex items-center justify-center gap-2.5 py-2.5 px-4 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#090F22] hover:bg-slate-50 dark:hover:bg-slate-800/70 disabled:opacity-60 text-sm font-medium text-[#0A1633] dark:text-white transition-colors"
                 >
                   <svg className="h-4 w-4" viewBox="0 0 24 24" aria-hidden="true">
                     <path
@@ -205,14 +279,14 @@ export function AuthView({
                       d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.31 0 3.26 2.7 1.29 6.62l3.99 3.14c.95-2.85 3.6-4.96 6.72-4.96Z"
                     />
                   </svg>
-                  <span>Continuar con Google</span>
+                  <span>{googleLoading ? 'Conectando con Google...' : 'Continuar con Google'}</span>
                 </button>
 
                 {showGoogleNotice && !googleAuthConfigured && (
                   <div className="mt-3 p-3 rounded-xl border border-amber-200 dark:border-amber-800/70 bg-amber-50 dark:bg-amber-950/40 text-xs text-amber-900 dark:text-amber-200 flex items-start gap-2">
                     <Info className="h-4 w-4 shrink-0 mt-0.5" />
                     <p>
-                      El acceso con Google está <strong>pendiente de configuración externa</strong> (requiere habilitar Firebase Authentication o configurar un ID de cliente OAuth de Google). Puedes crear tu cuenta o ingresar ahora mismo con tu correo electrónico y contraseña protegida en servidor.
+                      Falta configurar tus variables de <strong>Supabase</strong> (<code>SUPABASE_URL</code> y <code>SUPABASE_ANON_KEY</code>) con el proveedor Google activado en Supabase Authentication. Mientras tanto puedes ingresar o crear tu cuenta con correo y contraseña.
                     </p>
                   </div>
                 )}

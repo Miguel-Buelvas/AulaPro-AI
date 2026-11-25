@@ -1,5 +1,10 @@
 import { Component, useCallback, useEffect, useState, type ReactNode } from 'react';
 import { apiFetch } from './lib/api.ts';
+import {
+  exchangeSupabaseAccessToken,
+  getSupabaseBrowserClient,
+  type PublicSupabaseConfig,
+} from './lib/supabase.ts';
 import type { CatalogService, RateItem, ReviewsSummary, UserProfile } from './types.ts';
 import { LandingPage } from './components/LandingPage.tsx';
 import { AuthView } from './components/AuthView.tsx';
@@ -72,6 +77,7 @@ export default function App() {
   const [user, setUser] = useState<UserProfile | null>(null);
   const [adminNeedsSetup, setAdminNeedsSetup] = useState(false);
   const [googleAuthConfigured, setGoogleAuthConfigured] = useState(false);
+  const [supabaseConfig, setSupabaseConfig] = useState<PublicSupabaseConfig | null>(null);
 
   const [services, setServices] = useState<CatalogService[]>([]);
   const [rates, setRates] = useState<RateItem[]>([]);
@@ -105,13 +111,46 @@ export default function App() {
           user: UserProfile | null;
           adminNeedsSetup: boolean;
           googleAuthConfigured: boolean;
+          supabaseConfig?: PublicSupabaseConfig | null;
         }>('/api/auth/me'),
         loadCatalog(),
       ]);
-      setUser(meRes.user);
+
+      const cfg = meRes.supabaseConfig ?? null;
+      setSupabaseConfig(cfg);
       setAdminNeedsSetup(meRes.adminNeedsSetup);
       setGoogleAuthConfigured(meRes.googleAuthConfigured);
-      if (meRes.user) {
+
+      let activeUser = meRes.user;
+
+      // Handle Supabase Google OAuth callback (redirect or popup)
+      const hasOAuthParams =
+        window.location.hash.includes('access_token=') ||
+        window.location.search.includes('code=');
+      if (hasOAuthParams && cfg) {
+        const supabase = getSupabaseBrowserClient(cfg);
+        if (supabase) {
+          const { data } = await supabase.auth.getSession();
+          const token = data.session?.access_token;
+          if (token) {
+            if (window.opener) {
+              window.opener.postMessage(
+                { type: 'AULAPRO_SUPABASE_OAUTH', accessToken: token },
+                window.location.origin
+              );
+              await supabase.auth.signOut({ scope: 'local' });
+              window.close();
+              return;
+            }
+            activeUser = await exchangeSupabaseAccessToken(token);
+            await supabase.auth.signOut({ scope: 'local' });
+            window.history.replaceState({}, document.title, window.location.pathname);
+          }
+        }
+      }
+
+      setUser(activeUser);
+      if (activeUser) {
         setView('panel');
       }
     } catch (err) {
@@ -127,6 +166,10 @@ export default function App() {
 
   const handleLogout = async () => {
     await apiFetch('/api/auth/logout', { method: 'POST' });
+    const supabase = getSupabaseBrowserClient(supabaseConfig);
+    if (supabase) {
+      await supabase.auth.signOut({ scope: 'local' }).catch(() => undefined);
+    }
     setUser(null);
     setView('landing');
     setPreselectedService(null);
@@ -181,6 +224,7 @@ export default function App() {
           initialMode={authMode}
           adminNeedsSetup={adminNeedsSetup}
           googleAuthConfigured={googleAuthConfigured}
+          supabaseConfig={supabaseConfig}
           darkMode={darkMode}
           onToggleDark={() => setDarkMode((d) => !d)}
           onBackHome={() => setView('landing')}

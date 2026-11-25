@@ -1,7 +1,5 @@
 import { GoogleGenAI } from '@google/genai';
-import fs from 'fs';
-import path from 'path';
-import { UPLOAD_DIR } from './db.ts';
+import { readFileBuffer } from './storage.ts';
 
 function getClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -124,14 +122,14 @@ ${params.ratesContext}`;
     });
 
     for (const file of r.files.slice(0, 3)) {
-      const fullPath = path.resolve(UPLOAD_DIR, file.storedName);
-      if (!fullPath.startsWith(UPLOAD_DIR + path.sep) || !fs.existsSync(fullPath)) {
-        continue;
-      }
       if (file.sizeBytes > 6 * 1024 * 1024) {
         parts.push({
           text: `[Archivo ${file.originalName} omitido del análisis directo por superar 6 MB]`,
         });
+        continue;
+      }
+      const bytes = await readFileBuffer(file.storedName);
+      if (!bytes) {
         continue;
       }
       const supportedInline = [
@@ -142,7 +140,6 @@ ${params.ratesContext}`;
         'application/pdf',
       ];
       if (supportedInline.includes(file.mimeType)) {
-        const bytes = fs.readFileSync(fullPath);
         parts.push({
           inlineData: {
             mimeType: file.mimeType === 'image/jpg' ? 'image/jpeg' : file.mimeType,
@@ -155,7 +152,7 @@ ${params.ratesContext}`;
         file.originalName.endsWith('.csv') ||
         file.originalName.endsWith('.md')
       ) {
-        const textContent = fs.readFileSync(fullPath, 'utf8').slice(0, 12000);
+        const textContent = bytes.toString('utf8').slice(0, 12000);
         parts.push({
           text: `Contenido del archivo adjunto "${file.originalName}":\n${textContent}`,
         });

@@ -1,20 +1,22 @@
 import 'dotenv/config';
 import express from 'express';
 import crypto from 'crypto';
-import fs from 'fs';
 import path from 'path';
 import multer from 'multer';
 import * as XLSX from 'xlsx';
 import { createServer as createViteServer } from 'vite';
 import {
-  db,
-  UPLOAD_DIR,
+  store,
   getSetting,
   setSetting,
   getNextOrderNumber,
   createNotification,
   notifyAdmins,
-} from './server/db.ts';
+  type RequestWithStudentRow,
+  type FileRow,
+  type PaymentRow,
+  type ReviewRow,
+} from './server/store.ts';
 import {
   type AuthedRequest,
   clearSessionCookie,
@@ -33,8 +35,8 @@ import {
   verifyPassword,
 } from './server/auth.ts';
 import { askAdminAssistant, askStudentAssistant } from './server/ai.ts';
-
-syncEnvAdminIfNeeded();
+import { readFileBuffer, saveFileBuffer } from './server/storage.ts';
+import { getPublicSupabaseConfig, verifySupabaseAccessToken } from './server/supabaseClient.ts';
 
 const VALID_STATUSES = new Set([
   'Solicitud recibida',
@@ -72,19 +74,8 @@ const ALLOWED_EXTENSIONS = new Set([
   '.rar',
 ]);
 
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => {
-    cb(null, UPLOAD_DIR);
-  },
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    const safeExt = ALLOWED_EXTENSIONS.has(ext) ? ext : '.bin';
-    cb(null, `${crypto.randomUUID()}${safeExt}`);
-  },
-});
-
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: {
     fileSize: 20 * 1024 * 1024,
     files: 10,
@@ -99,32 +90,90 @@ const upload = multer({
   },
 });
 
+const asyncRoute =
+  (
+    fn: (
+      req: AuthedRequest,
+      res: express.Response,
+      next: express.NextFunction
+    ) => Promise<void>
+  ) =>
+  (req: AuthedRequest, res: express.Response, next: express.NextFunction) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+
+function generateStoredFilename(originalName: string): string {
+  const ext = path.extname(originalName).toLowerCase();
+  const safeExt = ALLOWED_EXTENSIONS.has(ext) ? ext : '.bin';
+  return `${crypto.randomUUID()}${safeExt}`;
+}
+
+async function persistUploadedFile(file: Express.Multer.File): Promise<string> {
+  const storedName = generateStoredFilename(file.originalname);
+  await saveFileBuffer(storedName, file.buffer, file.mimetype || 'application/octet-stream');
+  return storedName;
+}
+
 function formatLabelFromFilename(filename: string): string {
   const ext = path.extname(filename).replace('.', '').toUpperCase();
   return ext || 'FILE';
 }
 
-function mapFileRow(row: Record<string, unknown>) {
+function mapFileRow(row: FileRow) {
   return {
-    id: row.id as string,
-    requestId: row.request_id as string,
-    ownerId: row.owner_id as string,
-    kind: row.kind as 'attachment' | 'payment_proof' | 'delivery',
-    originalName: row.original_name as string,
-    mimeType: row.mime_type as string,
-    formatLabel: row.format_label as string,
+    id: row.id,
+    requestId: row.request_id,
+    ownerId: row.owner_id,
+    kind: row.kind,
+    originalName: row.original_name,
+    mimeType: row.mime_type,
+    formatLabel: row.format_label,
     sizeBytes: Number(row.size_bytes),
     version: Number(row.version),
     isLatest: Boolean(row.is_latest),
-    replacedFileId: (row.replaced_file_id as string | null) ?? null,
-    uploadedByRole: row.uploaded_by_role as 'student' | 'admin',
-    createdAt: row.created_at as string,
+    replacedFileId: row.replaced_file_id ?? null,
+    uploadedByRole: row.uploaded_by_role,
+    createdAt: row.created_at,
   };
 }
 
-function mapRequestRow(
-  row: Record<string, unknown>,
-  includePrivateAdminFields: boolean
+function mapPaymentRow(pr: PaymentRow) {
+  return {
+    id: pr.id,
+    requestId: pr.request_id,
+    studentId: pr.student_id,
+    method: pr.method,
+    nequiDestination: pr.nequi_destination,
+    amount: Number(pr.amount),
+    referenceCode: pr.reference_code,
+    proofFileId: pr.proof_file_id,
+    status: pr.status,
+    adminNote: pr.admin_note,
+    verifiedAt: pr.verified_at,
+    createdAt: pr.created_at,
+  };
+}
+
+function mapReviewRow(rv: ReviewRow) {
+  return {
+    id: rv.id,
+    requestId: rv.request_id,
+    studentId: rv.student_id,
+    studentDisplayName: rv.student_display_name,
+    serviceType: rv.service_type,
+    educationLevel: rv.education_level,
+    rating: Number(rv.rating),
+    comment: rv.comment,
+    isVisible: Boolean(rv.is_visible),
+    adminReply: rv.admin_reply,
+    createdAt: rv.created_at,
+  };
+}
+
+async function mapRequestRow(
+  row: RequestWithStudentRow,
+  includePrivateAdminFields: boolean,
+  nequiDefaults?: { nequiNumber: string; nequiHolder: string; paymentInstructions: string }
 ) {
   const quoteApproved = Boolean(row.quote_approved_by_admin);
   const base: Record<string, unknown> = {
@@ -165,9 +214,14 @@ function mapRequestRow(
   }
 
   if (quoteApproved) {
-    base.nequiNumber = getSetting('nequi_number', '3204236962');
-    base.nequiHolder = getSetting('nequi_holder', 'AulaPro AI');
-    base.paymentInstructions = getSetting('payment_instructions', '');
+    const nequi = nequiDefaults ?? {
+      nequiNumber: await getSetting('nequi_number', '3204236962'),
+      nequiHolder: await getSetting('nequi_holder', 'AulaPro AI'),
+      paymentInstructions: await getSetting('payment_instructions', ''),
+    };
+    base.nequiNumber = nequi.nequiNumber;
+    base.nequiHolder = nequi.nequiHolder;
+    base.paymentInstructions = nequi.paymentInstructions;
   } else {
     base.nequiNumber = null;
     base.nequiHolder = null;
@@ -177,7 +231,7 @@ function mapRequestRow(
   return base;
 }
 
-function calculateServerPreliminaryQuote(params: {
+async function calculateServerPreliminaryQuote(params: {
   educationLevel: string;
   difficulty: string;
   pages: number;
@@ -185,13 +239,11 @@ function calculateServerPreliminaryQuote(params: {
   slides: number;
   deadline: string;
   serviceType: string;
-}): number {
-  const catalogMatch = db
-    .prepare('SELECT base_price FROM catalog_services WHERE name = ? LIMIT 1')
-    .get(params.serviceType) as { base_price: number } | undefined;
-  const rateMatch = db
-    .prepare('SELECT base_price FROM rates WHERE service_name = ? LIMIT 1')
-    .get(params.serviceType) as { base_price: number } | undefined;
+}): Promise<number> {
+  const [catalogMatch, rateMatch] = await Promise.all([
+    store.getCatalogServiceByName(params.serviceType),
+    store.getRateByName(params.serviceType),
+  ]);
 
   const base = catalogMatch?.base_price ?? rateMatch?.base_price ?? 20000;
   let total = base;
@@ -227,704 +279,706 @@ function calculateServerPreliminaryQuote(params: {
 }
 
 async function startServer() {
+  await store.init();
+  await syncEnvAdminIfNeeded();
+
   const app = express();
   app.set('trust proxy', 1);
   app.use(express.json({ limit: '2mb' }));
   app.use('/api', csrfGuard);
 
   // ---------------- AUTH ROUTES ----------------
-  app.get('/api/auth/me', (req, res) => {
-    const token = getTokenFromRequest(req);
-    const user = getUserFromToken(token);
-    res.json({
-      user,
-      adminNeedsSetup: !hasConfiguredEnvAdmin() && !hasStoredAdmin(),
-      googleAuthConfigured: Boolean(process.env.GOOGLE_CLIENT_ID),
-    });
-  });
-
-  app.get('/api/auth/admin-status', (_req, res) => {
-    res.json({
-      needsSetup: !hasConfiguredEnvAdmin() && !hasStoredAdmin(),
-      envConfigured: hasConfiguredEnvAdmin(),
-    });
-  });
-
-  app.post('/api/auth/admin-setup', (req, res) => {
-    if (hasConfiguredEnvAdmin() || hasStoredAdmin()) {
-      res.status(403).json({
-        error: 'La cuenta de administrador ya está configurada y bloqueada contra registros externos.',
+  app.get(
+    '/api/auth/me',
+    asyncRoute(async (req, res) => {
+      const token = getTokenFromRequest(req);
+      const [user, storedAdmin] = await Promise.all([
+        getUserFromToken(token),
+        hasStoredAdmin(),
+      ]);
+      const supabaseConfig = getPublicSupabaseConfig();
+      res.json({
+        user,
+        adminNeedsSetup: !hasConfiguredEnvAdmin() && !storedAdmin,
+        googleAuthConfigured: Boolean(supabaseConfig),
+        supabaseConfig,
       });
-      return;
-    }
-    const email = String(req.body?.email || '').trim().toLowerCase();
-    const name = String(req.body?.name || 'Administrador AulaPro AI').trim();
-    const password = String(req.body?.password || '');
+    })
+  );
 
-    if (!email || !email.includes('@')) {
-      res.status(400).json({ error: 'Ingresa un correo electrónico válido.' });
-      return;
-    }
-    if (password.length < 8) {
-      res.status(400).json({ error: 'La contraseña de administrador debe tener al menos 8 caracteres.' });
-      return;
-    }
+  app.get(
+    '/api/auth/admin-status',
+    asyncRoute(async (_req, res) => {
+      const storedAdmin = await hasStoredAdmin();
+      res.json({
+        needsSetup: !hasConfiguredEnvAdmin() && !storedAdmin,
+        envConfigured: hasConfiguredEnvAdmin(),
+      });
+    })
+  );
 
-    const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
-    if (existing) {
-      res.status(409).json({ error: 'Ya existe una cuenta registrada con ese correo.' });
-      return;
-    }
+  app.post(
+    '/api/auth/admin-setup',
+    asyncRoute(async (req, res) => {
+      if (hasConfiguredEnvAdmin() || (await hasStoredAdmin())) {
+        res.status(403).json({
+          error: 'La cuenta de administrador ya está configurada y bloqueada contra registros externos.',
+        });
+        return;
+      }
+      const email = String(req.body?.email || '').trim().toLowerCase();
+      const name = String(req.body?.name || 'Administrador AulaPro AI').trim();
+      const password = String(req.body?.password || '');
 
-    const id = crypto.randomUUID();
-    const now = new Date().toISOString();
-    const passwordHash = hashPassword(password);
+      if (!email || !email.includes('@')) {
+        res.status(400).json({ error: 'Ingresa un correo electrónico válido.' });
+        return;
+      }
+      if (password.length < 8) {
+        res.status(400).json({ error: 'La contraseña de administrador debe tener al menos 8 caracteres.' });
+        return;
+      }
 
-    db.prepare(
-      `INSERT INTO users (id, email, name, phone, institution, education_level, program, role, password_hash, created_at, updated_at)
-       VALUES (?, ?, ?, '', 'AulaPro AI', 'Administración', 'Dirección Académica', 'admin', ?, ?, ?)`
-    ).run(id, email, name.slice(0, 120), passwordHash, now, now);
+      const existing = await store.getUserByEmail(email);
+      if (existing) {
+        res.status(409).json({ error: 'Ya existe una cuenta registrada con ese correo.' });
+        return;
+      }
 
-    const { token } = createSession(id);
-    setSessionCookie(req, res, token);
+      const id = crypto.randomUUID();
+      const now = new Date().toISOString();
+      const passwordHash = hashPassword(password);
 
-    const user = {
-      id,
-      email,
-      name: name.slice(0, 120),
-      phone: '',
-      institution: 'AulaPro AI',
-      educationLevel: 'Administración',
-      program: 'Dirección Académica',
-      role: 'admin' as const,
-      createdAt: now,
-    };
-    res.status(201).json({ user });
-  });
+      await store.createUser({
+        id,
+        email,
+        name: name.slice(0, 120),
+        phone: '',
+        institution: 'AulaPro AI',
+        education_level: 'Administración',
+        program: 'Dirección Académica',
+        role: 'admin',
+        password_hash: passwordHash,
+        created_at: now,
+        updated_at: now,
+      });
 
-  app.post('/api/auth/register', (req, res) => {
-    const email = String(req.body?.email || '').trim().toLowerCase();
-    const name = String(req.body?.name || '').trim();
-    const password = String(req.body?.password || '');
-    const phone = String(req.body?.phone || '').trim().slice(0, 30);
-    const institution = String(req.body?.institution || '').trim().slice(0, 120);
-    const educationLevel = String(req.body?.educationLevel || '').trim().slice(0, 60);
-    const program = String(req.body?.program || '').trim().slice(0, 120);
+      const { token } = await createSession(id);
+      setSessionCookie(req, res, token);
 
-    if (!name || name.length < 2) {
-      res.status(400).json({ error: 'Ingresa tu nombre completo.' });
-      return;
-    }
-    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      res.status(400).json({ error: 'Ingresa un correo electrónico válido.' });
-      return;
-    }
-    if (password.length < 8) {
-      res.status(400).json({ error: 'La contraseña debe tener al menos 8 caracteres.' });
-      return;
-    }
+      res.status(201).json({
+        user: {
+          id,
+          email,
+          name: name.slice(0, 120),
+          phone: '',
+          institution: 'AulaPro AI',
+          educationLevel: 'Administración',
+          program: 'Dirección Académica',
+          role: 'admin' as const,
+          createdAt: now,
+        },
+      });
+    })
+  );
 
-    const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
-    if (existing) {
-      res.status(409).json({ error: 'Ya existe una cuenta con ese correo electrónico.' });
-      return;
-    }
+  app.post(
+    '/api/auth/register',
+    asyncRoute(async (req, res) => {
+      const email = String(req.body?.email || '').trim().toLowerCase();
+      const name = String(req.body?.name || '').trim();
+      const password = String(req.body?.password || '');
+      const phone = String(req.body?.phone || '').trim().slice(0, 30);
+      const institution = String(req.body?.institution || '').trim().slice(0, 120);
+      const educationLevel = String(req.body?.educationLevel || '').trim().slice(0, 60);
+      const program = String(req.body?.program || '').trim().slice(0, 120);
 
-    const id = crypto.randomUUID();
-    const now = new Date().toISOString();
-    const passwordHash = hashPassword(password);
+      if (!name || name.length < 2) {
+        res.status(400).json({ error: 'Ingresa tu nombre completo.' });
+        return;
+      }
+      if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        res.status(400).json({ error: 'Ingresa un correo electrónico válido.' });
+        return;
+      }
+      if (password.length < 8) {
+        res.status(400).json({ error: 'La contraseña debe tener al menos 8 caracteres.' });
+        return;
+      }
 
-    db.prepare(
-      `INSERT INTO users (id, email, name, phone, institution, education_level, program, role, password_hash, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'student', ?, ?, ?)`
-    ).run(id, email, name.slice(0, 120), phone, institution, educationLevel, program, passwordHash, now, now);
+      const existing = await store.getUserByEmail(email);
+      if (existing) {
+        res.status(409).json({ error: 'Ya existe una cuenta con ese correo electrónico.' });
+        return;
+      }
 
-    const { token } = createSession(id);
-    setSessionCookie(req, res, token);
+      const id = crypto.randomUUID();
+      const now = new Date().toISOString();
+      const passwordHash = hashPassword(password);
 
-    createNotification({
-      recipientId: id,
-      title: 'Bienvenido a AulaPro AI',
-      message: 'Tu cuenta estudiantil ha sido creada. Ya puedes solicitar servicios académicos personalizados.',
-      type: 'welcome',
-    });
-
-    notifyAdmins({
-      title: 'Nuevo estudiante registrado',
-      message: `${name.slice(0, 120)} (${email}) se registró en AulaPro AI.`,
-      type: 'new_user',
-    });
-
-    res.status(201).json({
-      user: {
+      await store.createUser({
         id,
         email,
         name: name.slice(0, 120),
         phone,
         institution,
-        educationLevel,
+        education_level: educationLevel,
         program,
         role: 'student',
-        createdAt: now,
-      },
-    });
-  });
+        password_hash: passwordHash,
+        created_at: now,
+        updated_at: now,
+      });
 
-  app.post('/api/auth/login', (req, res) => {
-    const email = String(req.body?.email || '').trim().toLowerCase();
-    const password = String(req.body?.password || '');
+      const { token } = await createSession(id);
+      setSessionCookie(req, res, token);
 
-    if (!email || !password) {
-      res.status(400).json({ error: 'Ingresa tu correo y contraseña.' });
-      return;
-    }
+      await createNotification({
+        recipientId: id,
+        title: 'Bienvenido a AulaPro AI',
+        message: 'Tu cuenta estudiantil ha sido creada. Ya puedes solicitar servicios académicos personalizados.',
+        type: 'welcome',
+      });
 
-    const row = db.prepare('SELECT * FROM users WHERE email = ?').get(email) as
-      | Record<string, string>
-      | undefined;
+      await notifyAdmins({
+        title: 'Nuevo estudiante registrado',
+        message: `${name.slice(0, 120)} (${email}) se registró en AulaPro AI.`,
+        type: 'new_user',
+      });
 
-    if (!row || !verifyPassword(password, row.password_hash)) {
-      res.status(401).json({ error: 'Correo o contraseña incorrectos.' });
-      return;
-    }
+      res.status(201).json({
+        user: {
+          id,
+          email,
+          name: name.slice(0, 120),
+          phone,
+          institution,
+          educationLevel,
+          program,
+          role: 'student',
+          createdAt: now,
+        },
+      });
+    })
+  );
 
-    const { token } = createSession(row.id);
-    setSessionCookie(req, res, token);
+  app.post(
+    '/api/auth/login',
+    asyncRoute(async (req, res) => {
+      const email = String(req.body?.email || '').trim().toLowerCase();
+      const password = String(req.body?.password || '');
 
-    res.json({
-      user: {
-        id: row.id,
-        email: row.email,
-        name: row.name,
-        phone: row.phone,
-        institution: row.institution,
-        educationLevel: row.education_level,
-        program: row.program,
-        role: row.role,
-        createdAt: row.created_at,
-      },
-    });
-  });
+      if (!email || !password) {
+        res.status(400).json({ error: 'Ingresa tu correo y contraseña.' });
+        return;
+      }
 
-  app.post('/api/auth/logout', (req, res) => {
-    const token = getTokenFromRequest(req);
-    if (token) revokeSession(token);
-    clearSessionCookie(req, res);
-    res.json({ ok: true });
-  });
+      const row = await store.getUserByEmail(email);
+      if (!row || !verifyPassword(password, row.password_hash)) {
+        res.status(401).json({ error: 'Correo o contraseña incorrectos.' });
+        return;
+      }
 
-  app.patch('/api/profile', requireAuth, (req: AuthedRequest, res) => {
-    const user = req.user!;
-    const name = String(req.body?.name || user.name).trim().slice(0, 120);
-    const phone = String(req.body?.phone ?? user.phone).trim().slice(0, 30);
-    const institution = String(req.body?.institution ?? user.institution).trim().slice(0, 120);
-    const educationLevel = String(req.body?.educationLevel ?? user.educationLevel).trim().slice(0, 60);
-    const program = String(req.body?.program ?? user.program).trim().slice(0, 120);
-    const now = new Date().toISOString();
+      const { token } = await createSession(row.id);
+      setSessionCookie(req, res, token);
 
-    if (name.length < 2) {
-      res.status(400).json({ error: 'El nombre debe tener al menos 2 caracteres.' });
-      return;
-    }
+      res.json({
+        user: {
+          id: row.id,
+          email: row.email,
+          name: row.name,
+          phone: row.phone,
+          institution: row.institution,
+          educationLevel: row.education_level,
+          program: row.program,
+          role: row.role,
+          createdAt: row.created_at,
+        },
+      });
+    })
+  );
 
-    db.prepare(
-      'UPDATE users SET name = ?, phone = ?, institution = ?, education_level = ?, program = ?, updated_at = ? WHERE id = ?'
-    ).run(name, phone, institution, educationLevel, program, now, user.id);
+  app.post(
+    '/api/auth/supabase-session',
+    asyncRoute(async (req, res) => {
+      const accessToken = String(req.body?.accessToken || '').trim();
+      if (!accessToken) {
+        res.status(400).json({ error: 'Token de autenticación de Google requerido.' });
+        return;
+      }
 
-    res.json({
-      user: {
-        ...user,
+      const verified = await verifySupabaseAccessToken(accessToken);
+      if (!verified) {
+        res.status(401).json({ error: 'No fue posible verificar la sesión de Google con Supabase.' });
+        return;
+      }
+
+      let userRow = await store.getUserByEmail(verified.email);
+      if (!userRow) {
+        const now = new Date().toISOString();
+        const id = crypto.randomUUID();
+        const randomHash = hashPassword(crypto.randomBytes(24).toString('hex'));
+        userRow = {
+          id,
+          email: verified.email,
+          name: verified.name || 'Estudiante AulaPro',
+          phone: '',
+          institution: '',
+          education_level: 'Universidad',
+          program: '',
+          role: 'student',
+          password_hash: randomHash,
+          created_at: now,
+          updated_at: now,
+        };
+        await store.createUser(userRow);
+
+        await createNotification({
+          recipientId: id,
+          title: 'Bienvenido a AulaPro AI',
+          message: 'Tu cuenta estudiantil fue creada con Google. Ya puedes solicitar servicios académicos personalizados.',
+          type: 'welcome',
+        });
+
+        await notifyAdmins({
+          title: 'Nuevo estudiante registrado (Google)',
+          message: `${userRow.name} (${userRow.email}) se registró con Google en AulaPro AI.`,
+          type: 'new_user',
+        });
+      }
+
+      const { token } = await createSession(userRow.id);
+      setSessionCookie(req, res, token);
+
+      res.json({
+        user: {
+          id: userRow.id,
+          email: userRow.email,
+          name: userRow.name,
+          phone: userRow.phone,
+          institution: userRow.institution,
+          educationLevel: userRow.education_level,
+          program: userRow.program,
+          role: userRow.role,
+          createdAt: userRow.created_at,
+        },
+      });
+    })
+  );
+
+  app.post(
+    '/api/auth/logout',
+    asyncRoute(async (req, res) => {
+      const token = getTokenFromRequest(req);
+      if (token) await revokeSession(token);
+      clearSessionCookie(req, res);
+      res.json({ ok: true });
+    })
+  );
+
+  app.patch(
+    '/api/profile',
+    requireAuth,
+    asyncRoute(async (req, res) => {
+      const user = req.user!;
+      const name = String(req.body?.name || user.name).trim().slice(0, 120);
+      const phone = String(req.body?.phone ?? user.phone).trim().slice(0, 30);
+      const institution = String(req.body?.institution ?? user.institution).trim().slice(0, 120);
+      const educationLevel = String(req.body?.educationLevel ?? user.educationLevel).trim().slice(0, 60);
+      const program = String(req.body?.program ?? user.program).trim().slice(0, 120);
+      const now = new Date().toISOString();
+
+      if (name.length < 2) {
+        res.status(400).json({ error: 'El nombre debe tener al menos 2 caracteres.' });
+        return;
+      }
+
+      await store.updateUserProfile(user.id, {
         name,
         phone,
         institution,
-        educationLevel,
+        education_level: educationLevel,
         program,
-      },
-    });
-  });
+        updated_at: now,
+      });
+
+      res.json({
+        user: {
+          ...user,
+          name,
+          phone,
+          institution,
+          educationLevel,
+          program,
+        },
+      });
+    })
+  );
 
   // ---------------- CATALOG & RATES (PUBLIC) ----------------
-  app.get('/api/catalog', (_req, res) => {
-    const services = db
-      .prepare('SELECT id, category, name, description, base_price, active FROM catalog_services WHERE active = 1 ORDER BY sort_order ASC')
-      .all() as Array<Record<string, unknown>>;
+  app.get(
+    '/api/catalog',
+    asyncRoute(async (_req, res) => {
+      const [services, rates] = await Promise.all([
+        store.getCatalogServices(true),
+        store.getRates(),
+      ]);
 
-    const rates = db
-      .prepare('SELECT id, service_name, base_price, is_starting_from, notes, updated_at FROM rates ORDER BY sort_order ASC')
-      .all() as Array<Record<string, unknown>>;
-
-    res.json({
-      services: services.map((s) => ({
-        id: s.id,
-        category: s.category,
-        name: s.name,
-        description: s.description,
-        basePrice: Number(s.base_price),
-        active: Boolean(s.active),
-      })),
-      rates: rates.map((r) => ({
-        id: r.id,
-        serviceName: r.service_name,
-        basePrice: Number(r.base_price),
-        isStartingFrom: Boolean(r.is_starting_from),
-        notes: r.notes,
-        updatedAt: r.updated_at,
-      })),
-    });
-  });
+      res.json({
+        services: services.map((s) => ({
+          id: s.id,
+          category: s.category,
+          name: s.name,
+          description: s.description,
+          basePrice: Number(s.base_price),
+          active: Boolean(s.active),
+        })),
+        rates: rates.map((r) => ({
+          id: r.id,
+          serviceName: r.service_name,
+          basePrice: Number(r.base_price),
+          isStartingFrom: Boolean(r.is_starting_from),
+          notes: r.notes,
+          updatedAt: r.updated_at,
+        })),
+      });
+    })
+  );
 
   // ---------------- PUBLIC REVIEWS & RATINGS ----------------
-  app.get('/api/reviews', (_req, res) => {
-    const rows = db
-      .prepare(
-        `SELECT rv.*, r.order_number
-         FROM reviews rv
-         JOIN requests r ON r.id = rv.request_id
-         WHERE rv.is_visible = 1
-         ORDER BY rv.created_at DESC`
-      )
-      .all() as Array<Record<string, unknown>>;
+  app.get(
+    '/api/reviews',
+    asyncRoute(async (_req, res) => {
+      const rows = await store.listVisibleReviewsWithOrderNumber();
 
-    const distribution: Record<number, number> = { 5: 0, 4: 0, 3: 0, 2: 0, 1: 0 };
-    let sum = 0;
-    for (const row of rows) {
-      const rating = Math.min(5, Math.max(1, Number(row.rating)));
-      distribution[rating] = (distribution[rating] || 0) + 1;
-      sum += rating;
-    }
+      const distribution: Record<number, number> = { 5: 0, 4: 0, 3: 0, 2: 0, 1: 0 };
+      let sum = 0;
+      for (const row of rows) {
+        const rating = Math.min(5, Math.max(1, Number(row.rating)));
+        distribution[rating] = (distribution[rating] || 0) + 1;
+        sum += rating;
+      }
 
-    const totalReviews = rows.length;
-    const averageRating = totalReviews > 0 ? Number((sum / totalReviews).toFixed(1)) : 0;
+      const totalReviews = rows.length;
+      const averageRating = totalReviews > 0 ? Number((sum / totalReviews).toFixed(1)) : 0;
 
-    res.json({
-      averageRating,
-      totalReviews,
-      distribution,
-      reviews: rows.map((rv) => ({
-        id: rv.id,
-        requestId: rv.request_id,
-        orderNumber: rv.order_number,
-        studentId: rv.student_id,
-        studentDisplayName: rv.student_display_name,
-        serviceType: rv.service_type,
-        educationLevel: rv.education_level,
-        rating: Number(rv.rating),
-        comment: rv.comment,
-        isVisible: Boolean(rv.is_visible),
-        adminReply: rv.admin_reply,
-        createdAt: rv.created_at,
-      })),
-    });
-  });
+      res.json({
+        averageRating,
+        totalReviews,
+        distribution,
+        reviews: rows.map((rv) => ({
+          ...mapReviewRow(rv),
+          orderNumber: rv.order_number,
+        })),
+      });
+    })
+  );
 
   // ---------------- STUDENT & ADMIN REQUESTS ----------------
-  app.get('/api/requests', requireAuth, (req: AuthedRequest, res) => {
-    const user = req.user!;
-    const isAdmin = user.role === 'admin';
+  app.get(
+    '/api/requests',
+    requireAuth,
+    asyncRoute(async (req, res) => {
+      const user = req.user!;
+      const isAdmin = user.role === 'admin';
 
-    const rows = isAdmin
-      ? (db
-          .prepare(
-            `SELECT r.*, u.name as student_name, u.email as student_email, u.phone as student_phone
-             FROM requests r
-             JOIN users u ON u.id = r.student_id
-             ORDER BY r.created_at DESC`
-          )
-          .all() as Array<Record<string, unknown>>)
-      : (db
-          .prepare(
-            `SELECT r.*, u.name as student_name, u.email as student_email
-             FROM requests r
-             JOIN users u ON u.id = r.student_id
-             WHERE r.student_id = ?
-             ORDER BY r.created_at DESC`
-          )
-          .all(user.id) as Array<Record<string, unknown>>);
+      const rows = await store.listRequests(isAdmin ? undefined : user.id);
+      if (rows.length === 0) {
+        res.json({ requests: [] });
+        return;
+      }
 
-    const requestIds = rows.map((r) => r.id as string);
-    const filesByReq = new Map<string, ReturnType<typeof mapFileRow>[]>();
-    const paymentsByReq = new Map<string, Array<Record<string, unknown>>>();
+      const [fileRows, payRows, reviewRows, nequiNumber, nequiHolder, paymentInstructions] =
+        await Promise.all([
+          store.listFilesForUserRequests(isAdmin ? undefined : user.id),
+          store.listPayments(isAdmin ? {} : { studentId: user.id }),
+          store.listReviews(isAdmin ? undefined : user.id),
+          getSetting('nequi_number', '3204236962'),
+          getSetting('nequi_holder', 'AulaPro AI'),
+          getSetting('payment_instructions', ''),
+        ]);
 
-    if (requestIds.length > 0) {
-      const fileRows = isAdmin
-        ? (db.prepare('SELECT * FROM files ORDER BY created_at DESC').all() as Array<Record<string, unknown>>)
-        : (db
-            .prepare(
-              `SELECT f.* FROM files f
-               JOIN requests r ON r.id = f.request_id
-               WHERE r.student_id = ?
-               ORDER BY f.created_at DESC`
-            )
-            .all(user.id) as Array<Record<string, unknown>>);
-
+      const filesByReq = new Map<string, ReturnType<typeof mapFileRow>[]>();
       for (const fr of fileRows) {
-        const rid = fr.request_id as string;
-        if (!filesByReq.has(rid)) filesByReq.set(rid, []);
-        filesByReq.get(rid)!.push(mapFileRow(fr));
+        if (!filesByReq.has(fr.request_id)) filesByReq.set(fr.request_id, []);
+        filesByReq.get(fr.request_id)!.push(mapFileRow(fr));
       }
 
-      const payRows = isAdmin
-        ? (db.prepare('SELECT * FROM payments ORDER BY created_at DESC').all() as Array<Record<string, unknown>>)
-        : (db.prepare('SELECT * FROM payments WHERE student_id = ? ORDER BY created_at DESC').all(user.id) as Array<
-            Record<string, unknown>
-          >);
-
+      const paymentsByReq = new Map<string, ReturnType<typeof mapPaymentRow>[]>();
       for (const pr of payRows) {
-        const rid = pr.request_id as string;
-        if (!paymentsByReq.has(rid)) paymentsByReq.set(rid, []);
-        paymentsByReq.get(rid)!.push({
-          id: pr.id,
-          requestId: pr.request_id,
-          studentId: pr.student_id,
-          method: pr.method,
-          nequiDestination: pr.nequi_destination,
-          amount: Number(pr.amount),
-          referenceCode: pr.reference_code,
-          proofFileId: pr.proof_file_id,
-          status: pr.status,
-          adminNote: pr.admin_note,
-          verifiedAt: pr.verified_at,
-          createdAt: pr.created_at,
-        });
+        if (!paymentsByReq.has(pr.request_id)) paymentsByReq.set(pr.request_id, []);
+        paymentsByReq.get(pr.request_id)!.push(mapPaymentRow(pr));
       }
-      const reviewRows = isAdmin
-        ? (db.prepare('SELECT * FROM reviews').all() as Array<Record<string, unknown>>)
-        : (db.prepare('SELECT * FROM reviews WHERE student_id = ?').all(user.id) as Array<
-            Record<string, unknown>
-          >);
 
-      const reviewByReq = new Map<string, Record<string, unknown>>();
+      const reviewByReq = new Map<string, ReturnType<typeof mapReviewRow>>();
       for (const rv of reviewRows) {
-        reviewByReq.set(rv.request_id as string, {
-          id: rv.id,
-          requestId: rv.request_id,
-          studentId: rv.student_id,
-          studentDisplayName: rv.student_display_name,
-          serviceType: rv.service_type,
-          educationLevel: rv.education_level,
-          rating: Number(rv.rating),
-          comment: rv.comment,
-          isVisible: Boolean(rv.is_visible),
-          adminReply: rv.admin_reply,
-          createdAt: rv.created_at,
-        });
+        reviewByReq.set(rv.request_id, mapReviewRow(rv));
       }
 
-      const mapped = rows.map((row) => {
-        const reqObj = mapRequestRow(row, isAdmin);
-        reqObj.files = filesByReq.get(row.id as string) ?? [];
-        reqObj.payments = paymentsByReq.get(row.id as string) ?? [];
-        reqObj.review = reviewByReq.get(row.id as string) ?? null;
-        return reqObj;
-      });
+      const nequiDefaults = { nequiNumber, nequiHolder, paymentInstructions };
+      const mapped = await Promise.all(
+        rows.map(async (row) => {
+          const reqObj = await mapRequestRow(row, isAdmin, nequiDefaults);
+          reqObj.files = filesByReq.get(row.id) ?? [];
+          reqObj.payments = paymentsByReq.get(row.id) ?? [];
+          reqObj.review = reviewByReq.get(row.id) ?? null;
+          return reqObj;
+        })
+      );
 
       res.json({ requests: mapped });
-      return;
-    }
+    })
+  );
 
-    res.json({ requests: [] });
-  });
+  app.get(
+    '/api/requests/:id',
+    requireAuth,
+    asyncRoute(async (req, res) => {
+      const user = req.user!;
+      const isAdmin = user.role === 'admin';
+      const row = await store.getRequestById(req.params.id);
 
-  app.get('/api/requests/:id', requireAuth, (req: AuthedRequest, res) => {
-    const user = req.user!;
-    const isAdmin = user.role === 'admin';
-    const row = db
-      .prepare(
-        `SELECT r.*, u.name as student_name, u.email as student_email, u.phone as student_phone
-         FROM requests r
-         JOIN users u ON u.id = r.student_id
-         WHERE r.id = ?`
-      )
-      .get(req.params.id) as Record<string, unknown> | undefined;
+      if (!row) {
+        res.status(404).json({ error: 'Solicitud no encontrada.' });
+        return;
+      }
 
-    if (!row) {
-      res.status(404).json({ error: 'Solicitud no encontrada.' });
-      return;
-    }
+      if (!isAdmin && row.student_id !== user.id) {
+        res.status(403).json({ error: 'No tienes permiso para acceder a esta solicitud.' });
+        return;
+      }
 
-    if (!isAdmin && row.student_id !== user.id) {
-      res.status(403).json({ error: 'No tienes permiso para acceder a esta solicitud.' });
-      return;
-    }
+      const [fileRows, historyRows, paymentRows, reviewRow] = await Promise.all([
+        store.listFilesByRequest(row.id),
+        store.getStatusHistory(row.id),
+        store.listPayments({ requestId: row.id }),
+        store.getReviewByRequestId(row.id),
+      ]);
 
-    const files = (
-      db.prepare('SELECT * FROM files WHERE request_id = ? ORDER BY created_at DESC').all(row.id) as Array<
-        Record<string, unknown>
-      >
-    ).map(mapFileRow);
+      const result = await mapRequestRow(row, isAdmin);
+      result.files = fileRows.map(mapFileRow);
+      result.history = historyRows.map((h) => ({
+        id: h.id,
+        requestId: h.request_id,
+        status: h.status,
+        note: h.note,
+        changedBy: h.changed_by,
+        createdAt: h.created_at,
+      }));
+      result.payments = paymentRows.map(mapPaymentRow);
+      result.review = reviewRow ? mapReviewRow(reviewRow) : null;
+      res.json({ request: result });
+    })
+  );
 
-    const history = (
-      db
-        .prepare('SELECT * FROM request_status_history WHERE request_id = ? ORDER BY created_at ASC')
-        .all(row.id) as Array<Record<string, unknown>>
-    ).map((h) => ({
-      id: h.id,
-      requestId: h.request_id,
-      status: h.status,
-      note: h.note,
-      changedBy: h.changed_by,
-      createdAt: h.created_at,
-    }));
+  app.post(
+    '/api/requests/:id/review',
+    requireAuth,
+    asyncRoute(async (req, res) => {
+      const user = req.user!;
+      const row = await store.getRequestById(req.params.id);
+      if (!row) {
+        res.status(404).json({ error: 'Solicitud no encontrada.' });
+        return;
+      }
+      if (row.student_id !== user.id) {
+        res.status(403).json({ error: 'Solo el estudiante solicitante puede calificar este pedido.' });
+        return;
+      }
 
-    const payments = (
-      db.prepare('SELECT * FROM payments WHERE request_id = ? ORDER BY created_at DESC').all(row.id) as Array<
-        Record<string, unknown>
-      >
-    ).map((pr) => ({
-      id: pr.id,
-      requestId: pr.request_id,
-      studentId: pr.student_id,
-      method: pr.method,
-      nequiDestination: pr.nequi_destination,
-      amount: Number(pr.amount),
-      referenceCode: pr.reference_code,
-      proofFileId: pr.proof_file_id,
-      status: pr.status,
-      adminNote: pr.admin_note,
-      verifiedAt: pr.verified_at,
-      createdAt: pr.created_at,
-    }));
+      const eligibleStatuses = ['Trabajo finalizado', 'Disponible para descarga', 'Entregado'];
+      if (!eligibleStatuses.includes(String(row.status))) {
+        res.status(400).json({
+          error: 'Solo puedes calificar pedidos que ya hayan sido finalizados o entregados.',
+        });
+        return;
+      }
 
-    const reviewRow = db.prepare('SELECT * FROM reviews WHERE request_id = ?').get(row.id) as
-      | Record<string, unknown>
-      | undefined;
+      const rating = parseInt(String(req.body?.rating || '0'), 10);
+      const comment = String(req.body?.comment || '').trim().slice(0, 600);
+      if (!Number.isFinite(rating) || rating < 1 || rating > 5) {
+        res.status(400).json({ error: 'Selecciona una calificación entre 1 y 5 estrellas.' });
+        return;
+      }
+      if (comment.length < 5) {
+        res.status(400).json({ error: 'Escribe un breve comentario de al menos 5 caracteres.' });
+        return;
+      }
 
-    const result = mapRequestRow(row, isAdmin);
-    result.files = files;
-    result.history = history;
-    result.payments = payments;
-    result.review = reviewRow
-      ? {
-          id: reviewRow.id,
-          requestId: reviewRow.request_id,
-          studentId: reviewRow.student_id,
-          studentDisplayName: reviewRow.student_display_name,
-          serviceType: reviewRow.service_type,
-          educationLevel: reviewRow.education_level,
-          rating: Number(reviewRow.rating),
-          comment: reviewRow.comment,
-          isVisible: Boolean(reviewRow.is_visible),
-          adminReply: reviewRow.admin_reply,
-          createdAt: reviewRow.created_at,
-        }
-      : null;
-    res.json({ request: result });
-  });
+      const nameParts = user.name.trim().split(/\s+/);
+      const displayName =
+        nameParts.length > 1
+          ? `${nameParts[0]} ${nameParts[1][0].toUpperCase()}.`
+          : nameParts[0];
 
-  app.post('/api/requests/:id/review', requireAuth, (req: AuthedRequest, res) => {
-    const user = req.user!;
-    const row = db.prepare('SELECT * FROM requests WHERE id = ?').get(req.params.id) as
-      | Record<string, unknown>
-      | undefined;
-    if (!row) {
-      res.status(404).json({ error: 'Solicitud no encontrada.' });
-      return;
-    }
-    if (row.student_id !== user.id) {
-      res.status(403).json({ error: 'Solo el estudiante solicitante puede calificar este pedido.' });
-      return;
-    }
+      const now = new Date().toISOString();
+      const existing = await store.getReviewByRequestId(row.id);
 
-    const eligibleStatuses = ['Trabajo finalizado', 'Disponible para descarga', 'Entregado'];
-    if (!eligibleStatuses.includes(String(row.status))) {
-      res.status(400).json({
-        error: 'Solo puedes calificar pedidos que ya hayan sido finalizados o entregados.',
-      });
-      return;
-    }
+      if (existing) {
+        await store.updateReview(existing.id, { rating, comment });
+      } else {
+        await store.createReview({
+          id: crypto.randomUUID(),
+          request_id: row.id,
+          student_id: user.id,
+          student_display_name: displayName,
+          service_type: row.service_type,
+          education_level: row.education_level,
+          rating,
+          comment,
+          is_visible: 1,
+          admin_reply: '',
+          created_at: now,
+        });
 
-    const rating = parseInt(String(req.body?.rating || '0'), 10);
-    const comment = String(req.body?.comment || '').trim().slice(0, 600);
-    if (!Number.isFinite(rating) || rating < 1 || rating > 5) {
-      res.status(400).json({ error: 'Selecciona una calificación entre 1 y 5 estrellas.' });
-      return;
-    }
-    if (comment.length < 5) {
-      res.status(400).json({ error: 'Escribe un breve comentario de al menos 5 caracteres.' });
-      return;
-    }
+        await notifyAdmins({
+          requestId: row.id,
+          title: `Nueva calificación (${rating}★) · ${row.order_number}`,
+          message: `${displayName} calificó el servicio ${row.service_type}: "${comment.slice(0, 80)}"`,
+          type: 'new_review',
+        });
+      }
 
-    const nameParts = user.name.trim().split(/\s+/);
-    const displayName =
-      nameParts.length > 1
-        ? `${nameParts[0]} ${nameParts[1][0].toUpperCase()}.`
-        : nameParts[0];
+      res.status(201).json({ ok: true });
+    })
+  );
 
-    const now = new Date().toISOString();
-    const existing = db.prepare('SELECT id FROM reviews WHERE request_id = ?').get(row.id) as
-      | { id: string }
-      | undefined;
+  app.post(
+    '/api/requests',
+    requireAuth,
+    upload.array('files', 10),
+    asyncRoute(async (req, res) => {
+      const user = req.user!;
+      const body = req.body || {};
 
-    if (existing) {
-      db.prepare('UPDATE reviews SET rating = ?, comment = ? WHERE id = ?').run(
-        rating,
-        comment,
-        existing.id
-      );
-    } else {
-      db.prepare(
-        `INSERT INTO reviews (
-          id, request_id, student_id, student_display_name, service_type,
-          education_level, rating, comment, is_visible, admin_reply, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, '', ?)`
-      ).run(
-        crypto.randomUUID(),
-        row.id,
-        user.id,
-        displayName,
-        row.service_type,
-        row.education_level,
-        rating,
-        comment,
-        now
-      );
+      const educationLevel = String(body.educationLevel || '').trim().slice(0, 60);
+      const institution = String(body.institution || '').trim().slice(0, 120);
+      const academicProgram = String(body.academicProgram || '').trim().slice(0, 120);
+      const subject = String(body.subject || '').trim().slice(0, 120);
+      const serviceType = String(body.serviceType || '').trim().slice(0, 120);
+      const serviceCategory = String(body.serviceCategory || '').trim().slice(0, 100);
+      const description = String(body.description || '').trim().slice(0, 5000);
+      const pages = Math.max(0, Math.min(500, parseInt(String(body.pages || '0'), 10) || 0));
+      const exercises = Math.max(0, Math.min(500, parseInt(String(body.exercises || '0'), 10) || 0));
+      const slides = Math.max(0, Math.min(300, parseInt(String(body.slides || '0'), 10) || 0));
+      const difficulty = ['basica', 'media', 'alta'].includes(String(body.difficulty))
+        ? String(body.difficulty)
+        : 'media';
+      const deadline = String(body.deadline || '').trim().slice(0, 40);
+      const requestedFormat = String(body.requestedFormat || 'PDF').trim().slice(0, 40);
+      const additionalNotes = String(body.additionalNotes || '').trim().slice(0, 2000);
 
-      notifyAdmins({
-        requestId: row.id as string,
-        title: `Nueva calificación (${rating}★) · ${row.order_number}`,
-        message: `${displayName} calificó el servicio ${row.service_type}: "${comment.slice(0, 80)}"`,
-        type: 'new_review',
-      });
-    }
+      if (!educationLevel || !subject || !serviceType || !description || !deadline) {
+        res.status(400).json({
+          error: 'Completa nivel educativo, materia, tipo de servicio, descripción y fecha límite.',
+        });
+        return;
+      }
 
-    res.status(201).json({ ok: true });
-  });
+      const id = crypto.randomUUID();
+      const [orderNumber, preliminaryQuote] = await Promise.all([
+        getNextOrderNumber(),
+        calculateServerPreliminaryQuote({
+          educationLevel,
+          difficulty,
+          pages,
+          exercises,
+          slides,
+          deadline,
+          serviceType,
+        }),
+      ]);
+      const now = new Date().toISOString();
 
-  app.post('/api/requests', requireAuth, upload.array('files', 10), (req: AuthedRequest, res) => {
-    const user = req.user!;
-    const body = req.body || {};
-
-    const educationLevel = String(body.educationLevel || '').trim().slice(0, 60);
-    const institution = String(body.institution || '').trim().slice(0, 120);
-    const academicProgram = String(body.academicProgram || '').trim().slice(0, 120);
-    const subject = String(body.subject || '').trim().slice(0, 120);
-    const serviceType = String(body.serviceType || '').trim().slice(0, 120);
-    const serviceCategory = String(body.serviceCategory || '').trim().slice(0, 100);
-    const description = String(body.description || '').trim().slice(0, 5000);
-    const pages = Math.max(0, Math.min(500, parseInt(String(body.pages || '0'), 10) || 0));
-    const exercises = Math.max(0, Math.min(500, parseInt(String(body.exercises || '0'), 10) || 0));
-    const slides = Math.max(0, Math.min(300, parseInt(String(body.slides || '0'), 10) || 0));
-    const difficulty = ['basica', 'media', 'alta'].includes(String(body.difficulty))
-      ? String(body.difficulty)
-      : 'media';
-    const deadline = String(body.deadline || '').trim().slice(0, 40);
-    const requestedFormat = String(body.requestedFormat || 'PDF').trim().slice(0, 40);
-    const additionalNotes = String(body.additionalNotes || '').trim().slice(0, 2000);
-
-    if (!educationLevel || !subject || !serviceType || !description || !deadline) {
-      res.status(400).json({
-        error: 'Completa nivel educativo, materia, tipo de servicio, descripción y fecha límite.',
-      });
-      return;
-    }
-
-    const id = crypto.randomUUID();
-    const orderNumber = getNextOrderNumber();
-    const now = new Date().toISOString();
-    const preliminaryQuote = calculateServerPreliminaryQuote({
-      educationLevel,
-      difficulty,
-      pages,
-      exercises,
-      slides,
-      deadline,
-      serviceType,
-    });
-
-    const insertReq = db.prepare(
-      `INSERT INTO requests (
-        id, order_number, student_id, education_level, institution, academic_program,
-        subject, service_type, service_category, description, pages, exercises, slides,
-        difficulty, deadline, requested_format, additional_notes, preliminary_quote,
-        final_quote, quote_approved_by_admin, quote_notes, status, payment_status,
-        admin_private_notes, info_request_message, priority, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, '', 'Solicitud recibida', 'Pendiente de cotización', '', '', 'normal', ?, ?)`
-    );
-
-    insertReq.run(
-      id,
-      orderNumber,
-      user.id,
-      educationLevel,
-      institution,
-      academicProgram,
-      subject,
-      serviceType,
-      serviceCategory || 'General',
-      description,
-      pages,
-      exercises,
-      slides,
-      difficulty,
-      deadline,
-      requestedFormat,
-      additionalNotes,
-      preliminaryQuote,
-      now,
-      now
-    );
-
-    db.prepare(
-      'INSERT INTO request_status_history (id, request_id, status, note, changed_by, created_at) VALUES (?, ?, ?, ?, ?, ?)'
-    ).run(
-      crypto.randomUUID(),
-      id,
-      'Solicitud recibida',
-      'Solicitud registrada con cotización preliminar orientativa.',
-      'student',
-      now
-    );
-
-    const uploadedFiles = (req.files as Express.Multer.File[] | undefined) || [];
-    const insertFile = db.prepare(
-      `INSERT INTO files (
-        id, request_id, owner_id, kind, original_name, stored_name, mime_type,
-        format_label, size_bytes, version, is_latest, replaced_file_id, uploaded_by_role, created_at
-      ) VALUES (?, ?, ?, 'attachment', ?, ?, ?, ?, ?, 1, 1, NULL, 'student', ?)`
-    );
-
-    for (const file of uploadedFiles) {
-      insertFile.run(
-        crypto.randomUUID(),
+      await store.createRequest({
         id,
-        user.id,
-        file.originalname.slice(0, 200),
-        file.filename,
-        file.mimetype || 'application/octet-stream',
-        formatLabelFromFilename(file.originalname),
-        file.size,
-        now
-      );
-    }
+        order_number: orderNumber,
+        student_id: user.id,
+        education_level: educationLevel,
+        institution,
+        academic_program: academicProgram,
+        subject,
+        service_type: serviceType,
+        service_category: serviceCategory || 'General',
+        description,
+        pages,
+        exercises,
+        slides,
+        difficulty,
+        deadline,
+        requested_format: requestedFormat,
+        additional_notes: additionalNotes,
+        preliminary_quote: preliminaryQuote,
+        final_quote: null,
+        quote_approved_by_admin: 0,
+        quote_notes: '',
+        status: 'Solicitud recibida',
+        payment_status: 'Pendiente de cotización',
+        admin_private_notes: '',
+        info_request_message: '',
+        priority: 'normal',
+        created_at: now,
+        updated_at: now,
+      });
 
-    createNotification({
-      recipientId: user.id,
-      requestId: id,
-      title: `Solicitud ${orderNumber} recibida`,
-      message: `Recibimos tu solicitud de ${serviceType} (${subject}). El administrador revisará los detalles para confirmar el precio definitivo.`,
-      type: 'request_created',
-    });
+      await store.addStatusHistory({
+        id: crypto.randomUUID(),
+        request_id: id,
+        status: 'Solicitud recibida',
+        note: 'Solicitud registrada con cotización preliminar orientativa.',
+        changed_by: 'student',
+        created_at: now,
+      });
 
-    notifyAdmins({
-      requestId: id,
-      title: `Nueva solicitud ${orderNumber}`,
-      message: `${user.name} solicitó ${serviceType} (${subject}) · Preliminar $${preliminaryQuote.toLocaleString('es-CO')} COP.`,
-      type: 'admin_new_request',
-    });
+      const uploadedFiles = (req.files as Express.Multer.File[] | undefined) || [];
+      for (const file of uploadedFiles) {
+        const storedName = await persistUploadedFile(file);
+        await store.createFile({
+          id: crypto.randomUUID(),
+          request_id: id,
+          owner_id: user.id,
+          kind: 'attachment',
+          original_name: file.originalname.slice(0, 200),
+          stored_name: storedName,
+          mime_type: file.mimetype || 'application/octet-stream',
+          format_label: formatLabelFromFilename(file.originalname),
+          size_bytes: file.size,
+          version: 1,
+          is_latest: 1,
+          replaced_file_id: null,
+          uploaded_by_role: 'student',
+          created_at: now,
+        });
+      }
 
-    const createdRow = db.prepare('SELECT * FROM requests WHERE id = ?').get(id) as Record<string, unknown>;
-    res.status(201).json({ request: mapRequestRow(createdRow, user.role === 'admin') });
-  });
+      await Promise.all([
+        createNotification({
+          recipientId: user.id,
+          requestId: id,
+          title: `Solicitud ${orderNumber} recibida`,
+          message: `Recibimos tu solicitud de ${serviceType} (${subject}). El administrador revisará los detalles para confirmar el precio definitivo.`,
+          type: 'request_created',
+        }),
+        notifyAdmins({
+          requestId: id,
+          title: `Nueva solicitud ${orderNumber}`,
+          message: `${user.name} solicitó ${serviceType} (${subject}) · Preliminar $${preliminaryQuote.toLocaleString('es-CO')} COP.`,
+          type: 'admin_new_request',
+        }),
+      ]);
+
+      const createdRow = (await store.getRequestById(id))!;
+      res.status(201).json({ request: await mapRequestRow(createdRow, user.role === 'admin') });
+    })
+  );
 
   app.post(
     '/api/requests/:id/attachments',
     requireAuth,
     upload.array('files', 10),
-    (req: AuthedRequest, res) => {
+    asyncRoute(async (req, res) => {
       const user = req.user!;
-      const row = db.prepare('SELECT * FROM requests WHERE id = ?').get(req.params.id) as
-        | Record<string, unknown>
-        | undefined;
+      const row = await store.getRequestById(req.params.id);
       if (!row) {
         res.status(404).json({ error: 'Solicitud no encontrada.' });
         return;
@@ -942,49 +996,50 @@ async function startServer() {
       }
 
       const now = new Date().toISOString();
-      const insertFile = db.prepare(
-        `INSERT INTO files (
-          id, request_id, owner_id, kind, original_name, stored_name, mime_type,
-          format_label, size_bytes, version, is_latest, replaced_file_id, uploaded_by_role, created_at
-        ) VALUES (?, ?, ?, 'attachment', ?, ?, ?, ?, ?, 1, 1, NULL, ?, ?)`
-      );
-
       for (const file of uploadedFiles) {
-        insertFile.run(
-          crypto.randomUUID(),
-          row.id,
-          row.student_id,
-          file.originalname.slice(0, 200),
-          file.filename,
-          file.mimetype || 'application/octet-stream',
-          formatLabelFromFilename(file.originalname),
-          file.size,
-          user.role,
-          now
-        );
+        const storedName = await persistUploadedFile(file);
+        await store.createFile({
+          id: crypto.randomUUID(),
+          request_id: row.id,
+          owner_id: row.student_id,
+          kind: 'attachment',
+          original_name: file.originalname.slice(0, 200),
+          stored_name: storedName,
+          mime_type: file.mimetype || 'application/octet-stream',
+          format_label: formatLabelFromFilename(file.originalname),
+          size_bytes: file.size,
+          version: 1,
+          is_latest: 1,
+          replaced_file_id: null,
+          uploaded_by_role: user.role,
+          created_at: now,
+        });
       }
 
       if (row.status === 'Requiere información' && user.role === 'student') {
-        db.prepare("UPDATE requests SET status = 'En revisión', updated_at = ? WHERE id = ?").run(now, row.id);
-        db.prepare(
-          'INSERT INTO request_status_history (id, request_id, status, note, changed_by, created_at) VALUES (?, ?, ?, ?, ?, ?)'
-        ).run(
-          crypto.randomUUID(),
-          row.id,
-          'En revisión',
-          note || 'El estudiante adjuntó información adicional.',
-          'student',
-          now
-        );
+        await store.updateRequest(row.id, { status: 'En revisión', updated_at: now });
+        await store.addStatusHistory({
+          id: crypto.randomUUID(),
+          request_id: row.id,
+          status: 'En revisión',
+          note: note || 'El estudiante adjuntó información adicional.',
+          changed_by: 'student',
+          created_at: now,
+        });
       } else if (note) {
-        db.prepare(
-          'INSERT INTO request_status_history (id, request_id, status, note, changed_by, created_at) VALUES (?, ?, ?, ?, ?, ?)'
-        ).run(crypto.randomUUID(), row.id, row.status, note, user.role, now);
+        await store.addStatusHistory({
+          id: crypto.randomUUID(),
+          request_id: row.id,
+          status: row.status,
+          note,
+          changed_by: user.role,
+          created_at: now,
+        });
       }
 
       if (user.role === 'student') {
-        notifyAdmins({
-          requestId: row.id as string,
+        await notifyAdmins({
+          requestId: row.id,
           title: `Nuevos adjuntos en ${row.order_number}`,
           message: `${user.name} subió ${uploadedFiles.length} archivo(s) adicional(es).`,
           type: 'admin_new_attachment',
@@ -992,7 +1047,7 @@ async function startServer() {
       }
 
       res.json({ ok: true });
-    }
+    })
   );
 
   // ---------------- STUDENT NEQUI PAYMENT SUBMISSION ----------------
@@ -1000,11 +1055,9 @@ async function startServer() {
     '/api/requests/:id/payments',
     requireAuth,
     upload.single('proof'),
-    (req: AuthedRequest, res) => {
+    asyncRoute(async (req, res) => {
       const user = req.user!;
-      const row = db.prepare('SELECT * FROM requests WHERE id = ?').get(req.params.id) as
-        | Record<string, unknown>
-        | undefined;
+      const row = await store.getRequestById(req.params.id);
 
       if (!row) {
         res.status(404).json({ error: 'Solicitud no encontrada.' });
@@ -1035,552 +1088,570 @@ async function startServer() {
       const now = new Date().toISOString();
       const proofFileId = crypto.randomUUID();
       const paymentId = crypto.randomUUID();
-      const nequiDest = getSetting('nequi_number', '3204236962');
+      const nequiDest = await getSetting('nequi_number', '3204236962');
       const amount = Number(row.final_quote);
+      const storedName = await persistUploadedFile(proofFile);
 
-      db.prepare(
-        `INSERT INTO files (
-          id, request_id, owner_id, kind, original_name, stored_name, mime_type,
-          format_label, size_bytes, version, is_latest, replaced_file_id, uploaded_by_role, created_at
-        ) VALUES (?, ?, ?, 'payment_proof', ?, ?, ?, ?, ?, 1, 1, NULL, 'student', ?)`
-      ).run(
-        proofFileId,
-        row.id,
-        user.id,
-        proofFile.originalname.slice(0, 200),
-        proofFile.filename,
-        proofFile.mimetype || 'application/octet-stream',
-        formatLabelFromFilename(proofFile.originalname),
-        proofFile.size,
-        now
-      );
-
-      db.prepare(
-        `INSERT INTO payments (
-          id, request_id, student_id, method, nequi_destination, amount,
-          reference_code, proof_file_id, status, admin_note, verified_at, created_at
-        ) VALUES (?, ?, ?, 'Nequi', ?, ?, ?, ?, 'Pago pendiente de verificación', '', NULL, ?)`
-      ).run(paymentId, row.id, user.id, nequiDest, amount, referenceCode, proofFileId, now);
-
-      db.prepare(
-        `UPDATE requests
-         SET status = 'Pago pendiente de verificación', payment_status = 'En verificación', updated_at = ?
-         WHERE id = ?`
-      ).run(now, row.id);
-
-      db.prepare(
-        'INSERT INTO request_status_history (id, request_id, status, note, changed_by, created_at) VALUES (?, ?, ?, ?, ?, ?)'
-      ).run(
-        crypto.randomUUID(),
-        row.id,
-        'Pago pendiente de verificación',
-        `Comprobante Nequi adjuntado${referenceCode ? ` (Ref: ${referenceCode})` : ''}. En espera de verificación manual.`,
-        'student',
-        now
-      );
-
-      createNotification({
-        recipientId: user.id,
-        requestId: row.id as string,
-        title: `Comprobante recibido · ${row.order_number}`,
-        message: 'Tu comprobante está siendo verificado personalmente por el administrador.',
-        type: 'payment_verifying',
+      await store.createFile({
+        id: proofFileId,
+        request_id: row.id,
+        owner_id: user.id,
+        kind: 'payment_proof',
+        original_name: proofFile.originalname.slice(0, 200),
+        stored_name: storedName,
+        mime_type: proofFile.mimetype || 'application/octet-stream',
+        format_label: formatLabelFromFilename(proofFile.originalname),
+        size_bytes: proofFile.size,
+        version: 1,
+        is_latest: 1,
+        replaced_file_id: null,
+        uploaded_by_role: 'student',
+        created_at: now,
       });
 
-      notifyAdmins({
-        requestId: row.id as string,
-        title: `Comprobante Nequi por verificar · ${row.order_number}`,
-        message: `${user.name} subió comprobante por $${amount.toLocaleString('es-CO')} COP.`,
-        type: 'admin_payment_proof',
+      await store.createPayment({
+        id: paymentId,
+        request_id: row.id,
+        student_id: user.id,
+        method: 'Nequi',
+        nequi_destination: nequiDest,
+        amount,
+        reference_code: referenceCode,
+        proof_file_id: proofFileId,
+        status: 'Pago pendiente de verificación',
+        admin_note: '',
+        verified_at: null,
+        created_at: now,
       });
+
+      await store.updateRequest(row.id, {
+        status: 'Pago pendiente de verificación',
+        payment_status: 'En verificación',
+        updated_at: now,
+      });
+
+      await store.addStatusHistory({
+        id: crypto.randomUUID(),
+        request_id: row.id,
+        status: 'Pago pendiente de verificación',
+        note: `Comprobante Nequi adjuntado${referenceCode ? ` (Ref: ${referenceCode})` : ''}. En espera de verificación manual.`,
+        changed_by: 'student',
+        created_at: now,
+      });
+
+      await Promise.all([
+        createNotification({
+          recipientId: user.id,
+          requestId: row.id,
+          title: `Comprobante recibido · ${row.order_number}`,
+          message: 'Tu comprobante está siendo verificado personalmente por el administrador.',
+          type: 'payment_verifying',
+        }),
+        notifyAdmins({
+          requestId: row.id,
+          title: `Comprobante Nequi por verificar · ${row.order_number}`,
+          message: `${user.name} subió comprobante por $${amount.toLocaleString('es-CO')} COP.`,
+          type: 'admin_payment_proof',
+        }),
+      ]);
 
       res.status(201).json({ ok: true, paymentId });
-    }
+    })
   );
 
   // ---------------- PRIVATE FILE DOWNLOAD ----------------
-  app.get('/api/files/:fileId', requireAuth, (req: AuthedRequest, res) => {
-    const user = req.user!;
-    const fileRow = db
-      .prepare(
-        `SELECT f.*, r.student_id as request_student_id
-         FROM files f
-         JOIN requests r ON r.id = f.request_id
-         WHERE f.id = ?`
-      )
-      .get(req.params.fileId) as Record<string, unknown> | undefined;
+  app.get(
+    '/api/files/:fileId',
+    requireAuth,
+    asyncRoute(async (req, res) => {
+      const user = req.user!;
+      const fileRow = await store.getFileWithRequestStudent(req.params.fileId);
 
-    if (!fileRow) {
-      res.status(404).json({ error: 'Archivo no encontrado.' });
-      return;
-    }
+      if (!fileRow) {
+        res.status(404).json({ error: 'Archivo no encontrado.' });
+        return;
+      }
 
-    const isOwner =
-      fileRow.owner_id === user.id || fileRow.request_student_id === user.id;
-    if (user.role !== 'admin' && !isOwner) {
-      res.status(403).json({ error: 'Este archivo es privado y no tienes permiso para descargarlo.' });
-      return;
-    }
+      const isOwner =
+        fileRow.owner_id === user.id || fileRow.request_student_id === user.id;
+      if (user.role !== 'admin' && !isOwner) {
+        res.status(403).json({ error: 'Este archivo es privado y no tienes permiso para descargarlo.' });
+        return;
+      }
 
-    const resolvedPath = path.resolve(UPLOAD_DIR, String(fileRow.stored_name));
-    if (!resolvedPath.startsWith(UPLOAD_DIR + path.sep) || !fs.existsSync(resolvedPath)) {
-      res.status(404).json({ error: 'El archivo físico no está disponible en el servidor.' });
-      return;
-    }
+      const buffer = await readFileBuffer(fileRow.stored_name);
+      if (!buffer) {
+        res.status(404).json({ error: 'El archivo físico no está disponible en el servidor.' });
+        return;
+      }
 
-    res.download(resolvedPath, String(fileRow.original_name));
-  });
+      const safeDownloadName = path.basename(fileRow.original_name).replace(/["\r\n]/g, '_');
+      res.setHeader('Content-Type', fileRow.mime_type || 'application/octet-stream');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${safeDownloadName}"; filename*=UTF-8''${encodeURIComponent(safeDownloadName)}`
+      );
+      res.send(buffer);
+    })
+  );
 
   // ---------------- NOTIFICATIONS ----------------
-  app.get('/api/notifications', requireAuth, (req: AuthedRequest, res) => {
-    const rows = db
-      .prepare('SELECT * FROM notifications WHERE recipient_id = ? ORDER BY created_at DESC LIMIT 60')
-      .all(req.user!.id) as Array<Record<string, unknown>>;
+  app.get(
+    '/api/notifications',
+    requireAuth,
+    asyncRoute(async (req, res) => {
+      const rows = await store.listNotifications(req.user!.id, 60);
 
-    res.json({
-      notifications: rows.map((n) => ({
-        id: n.id,
-        recipientId: n.recipient_id,
-        requestId: n.request_id,
-        title: n.title,
-        message: n.message,
-        type: n.type,
-        isRead: Boolean(n.is_read),
-        createdAt: n.created_at,
-      })),
-    });
-  });
+      res.json({
+        notifications: rows.map((n) => ({
+          id: n.id,
+          recipientId: n.recipient_id,
+          requestId: n.request_id,
+          title: n.title,
+          message: n.message,
+          type: n.type,
+          isRead: Boolean(n.is_read),
+          createdAt: n.created_at,
+        })),
+      });
+    })
+  );
 
-  app.patch('/api/notifications/:id/read', requireAuth, (req: AuthedRequest, res) => {
-    db.prepare('UPDATE notifications SET is_read = 1 WHERE id = ? AND recipient_id = ?').run(
-      req.params.id,
-      req.user!.id
-    );
-    res.json({ ok: true });
-  });
+  app.patch(
+    '/api/notifications/:id/read',
+    requireAuth,
+    asyncRoute(async (req, res) => {
+      await store.markNotificationRead(req.params.id, req.user!.id);
+      res.json({ ok: true });
+    })
+  );
 
-  app.post('/api/notifications/read-all', requireAuth, (req: AuthedRequest, res) => {
-    db.prepare('UPDATE notifications SET is_read = 1 WHERE recipient_id = ?').run(req.user!.id);
-    res.json({ ok: true });
-  });
+  app.post(
+    '/api/notifications/read-all',
+    requireAuth,
+    asyncRoute(async (req, res) => {
+      await store.markAllNotificationsRead(req.user!.id);
+      res.json({ ok: true });
+    })
+  );
 
   // ---------------- ADMIN ROUTES ----------------
-  app.get('/api/admin/overview', requireAdmin, (_req, res) => {
-    const now = new Date();
-    const todayPrefix = now.toISOString().slice(0, 10);
-    const monthPrefix = now.toISOString().slice(0, 7);
-    const yearPrefix = now.toISOString().slice(0, 4);
-    const weekAgoIso = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  app.get(
+    '/api/admin/overview',
+    requireAdmin,
+    asyncRoute(async (_req, res) => {
+      const now = new Date();
+      const todayPrefix = now.toISOString().slice(0, 10);
+      const monthPrefix = now.toISOString().slice(0, 7);
+      const yearPrefix = now.toISOString().slice(0, 4);
+      const weekAgoIso = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString();
 
-    const totalUsers = (
-      db.prepare("SELECT COUNT(*) as c FROM users WHERE role = 'student'").get() as { c: number }
-    ).c;
-    const newUsers = (
-      db
-        .prepare("SELECT COUNT(*) as c FROM users WHERE role = 'student' AND created_at >= ?")
-        .get(weekAgoIso) as { c: number }
-    ).c;
+      const [allUsers, allRequests, allPayments] = await Promise.all([
+        store.listAllUsers(),
+        store.listRequests(),
+        store.listPayments({}),
+      ]);
 
-    const totalRequests = (db.prepare('SELECT COUNT(*) as c FROM requests').get() as { c: number }).c;
-    const pendingQuotes = (
-      db
-        .prepare(
-          "SELECT COUNT(*) as c FROM requests WHERE quote_approved_by_admin = 0 AND status != 'Cancelado'"
-        )
-        .get() as { c: number }
-    ).c;
-    const pendingPayments = (
-      db
-        .prepare("SELECT COUNT(*) as c FROM payments WHERE status = 'Pago pendiente de verificación'")
-        .get() as { c: number }
-    ).c;
-    const confirmedPayments = (
-      db.prepare("SELECT COUNT(*) as c FROM payments WHERE status = 'Pago confirmado'").get() as {
-        c: number;
-      }
-    ).c;
-    const inProgress = (
-      db
-        .prepare(
-          "SELECT COUNT(*) as c FROM requests WHERE status IN ('Pago confirmado', 'En cola', 'En desarrollo', 'En revisión de calidad')"
-        )
-        .get() as { c: number }
-    ).c;
-    const completed = (
-      db
-        .prepare(
-          "SELECT COUNT(*) as c FROM requests WHERE status IN ('Trabajo finalizado', 'Disponible para descarga', 'Entregado')"
-        )
-        .get() as { c: number }
-    ).c;
-    const canceled = (
-      db.prepare("SELECT COUNT(*) as c FROM requests WHERE status = 'Cancelado'").get() as { c: number }
-    ).c;
+      const students = allUsers.filter((u) => u.role === 'student');
+      const totalUsers = students.length;
+      const newUsers = students.filter((u) => u.created_at >= weekAgoIso).length;
 
-    const confirmedRows = db
-      .prepare("SELECT amount, verified_at, created_at FROM payments WHERE status = 'Pago confirmado'")
-      .all() as Array<{ amount: number; verified_at: string | null; created_at: string }>;
+      const totalRequests = allRequests.length;
+      const pendingQuotes = allRequests.filter(
+        (r) => !r.quote_approved_by_admin && r.status !== 'Cancelado'
+      ).length;
+      const pendingPayments = allPayments.filter(
+        (p) => p.status === 'Pago pendiente de verificación'
+      ).length;
+      const confirmedRows = allPayments.filter((p) => p.status === 'Pago confirmado');
+      const confirmedPayments = confirmedRows.length;
 
-    let dailyIncome = 0;
-    let weeklyIncome = 0;
-    let monthlyIncome = 0;
-    let annualIncome = 0;
-
-    for (const p of confirmedRows) {
-      const refDate = p.verified_at || p.created_at;
-      if (refDate.startsWith(todayPrefix)) dailyIncome += p.amount;
-      if (refDate >= weekAgoIso) weeklyIncome += p.amount;
-      if (refDate.startsWith(monthPrefix)) monthlyIncome += p.amount;
-      if (refDate.startsWith(yearPrefix)) annualIncome += p.amount;
-    }
-
-    const pendingAmount = (
-      db
-        .prepare(
-          "SELECT COALESCE(SUM(final_quote), 0) as total FROM requests WHERE quote_approved_by_admin = 1 AND payment_status IN ('Esperando pago', 'En verificación') AND status != 'Cancelado'"
-        )
-        .get() as { total: number }
-    ).total;
-
-    const avgOrderValue =
-      confirmedRows.length > 0
-        ? Math.round(confirmedRows.reduce((acc, p) => acc + p.amount, 0) / confirmedRows.length)
-        : 0;
-
-    const topServices = db
-      .prepare(
-        `SELECT service_type as serviceType, COUNT(*) as count,
-         COALESCE(SUM(CASE WHEN payment_status = 'Pago confirmado' THEN final_quote ELSE 0 END), 0) as revenue
-         FROM requests
-         GROUP BY service_type
-         ORDER BY count DESC
-         LIMIT 8`
-      )
-      .all();
-
-    res.json({
-      totalUsers,
-      newUsers,
-      totalRequests,
-      pendingQuotes,
-      pendingPayments,
-      confirmedPayments,
-      inProgress,
-      completed,
-      canceled,
-      dailyIncome,
-      weeklyIncome,
-      monthlyIncome,
-      annualIncome,
-      pendingAmount,
-      avgOrderValue,
-      topServices,
-    });
-  });
-
-  app.get('/api/admin/users', requireAdmin, (_req, res) => {
-    const rows = db
-      .prepare(
-        `SELECT u.id, u.email, u.name, u.phone, u.institution, u.education_level, u.program, u.role, u.created_at,
-                (SELECT COUNT(*) FROM requests r WHERE r.student_id = u.id) as request_count,
-                (SELECT COALESCE(SUM(p.amount), 0) FROM payments p WHERE p.student_id = u.id AND p.status = 'Pago confirmado') as total_paid
-         FROM users u
-         ORDER BY u.created_at DESC`
-      )
-      .all() as Array<Record<string, unknown>>;
-
-    res.json({
-      users: rows.map((u) => ({
-        id: u.id,
-        email: u.email,
-        name: u.name,
-        phone: u.phone,
-        institution: u.institution,
-        educationLevel: u.education_level,
-        program: u.program,
-        role: u.role,
-        createdAt: u.created_at,
-        requestCount: Number(u.request_count),
-        totalPaid: Number(u.total_paid),
-      })),
-    });
-  });
-
-  app.get('/api/admin/payments', requireAdmin, (_req, res) => {
-    const rows = db
-      .prepare(
-        `SELECT p.*, r.order_number, r.service_type, u.name as student_name, u.email as student_email,
-                f.original_name as proof_file_name
-         FROM payments p
-         JOIN requests r ON r.id = p.request_id
-         JOIN users u ON u.id = p.student_id
-         LEFT JOIN files f ON f.id = p.proof_file_id
-         ORDER BY p.created_at DESC`
-      )
-      .all() as Array<Record<string, unknown>>;
-
-    res.json({
-      payments: rows.map((p) => ({
-        id: p.id,
-        requestId: p.request_id,
-        orderNumber: p.order_number,
-        serviceType: p.service_type,
-        studentId: p.student_id,
-        studentName: p.student_name,
-        studentEmail: p.student_email,
-        method: p.method,
-        nequiDestination: p.nequi_destination,
-        amount: Number(p.amount),
-        referenceCode: p.reference_code,
-        proofFileId: p.proof_file_id,
-        proofFileName: p.proof_file_name,
-        status: p.status,
-        adminNote: p.admin_note,
-        verifiedAt: p.verified_at,
-        createdAt: p.created_at,
-      })),
-    });
-  });
-
-  app.get('/api/admin/files', requireAdmin, (_req, res) => {
-    const rows = db
-      .prepare(
-        `SELECT f.*, r.order_number, u.name as student_name
-         FROM files f
-         JOIN requests r ON r.id = f.request_id
-         JOIN users u ON u.id = f.owner_id
-         ORDER BY f.created_at DESC`
-      )
-      .all() as Array<Record<string, unknown>>;
-
-    res.json({
-      files: rows.map((f) => ({
-        ...mapFileRow(f),
-        orderNumber: f.order_number,
-        studentName: f.student_name,
-      })),
-    });
-  });
-
-  app.patch('/api/admin/requests/:id/quote', requireAdmin, (req, res) => {
-    const row = db.prepare('SELECT * FROM requests WHERE id = ?').get(req.params.id) as
-      | Record<string, unknown>
-      | undefined;
-    if (!row) {
-      res.status(404).json({ error: 'Solicitud no encontrada.' });
-      return;
-    }
-
-    const finalQuote = parseInt(String(req.body?.finalQuote || '0'), 10);
-    const quoteNotes = String(req.body?.quoteNotes || '').trim().slice(0, 1500);
-    if (!Number.isFinite(finalQuote) || finalQuote < 1000) {
-      res.status(400).json({ error: 'Ingresa un valor definitivo válido en pesos colombianos.' });
-      return;
-    }
-
-    const now = new Date().toISOString();
-    const nextStatus =
-      row.payment_status === 'Pago confirmado' ? (row.status as string) : 'Cotización enviada';
-    const nextPayStatus =
-      row.payment_status === 'Pago confirmado' ? 'Pago confirmado' : 'Esperando pago';
-
-    db.prepare(
-      `UPDATE requests
-       SET final_quote = ?, quote_approved_by_admin = 1, quote_notes = ?,
-           status = ?, payment_status = ?, updated_at = ?
-       WHERE id = ?`
-    ).run(finalQuote, quoteNotes, nextStatus, nextPayStatus, now, row.id);
-
-    db.prepare(
-      'INSERT INTO request_status_history (id, request_id, status, note, changed_by, created_at) VALUES (?, ?, ?, ?, ?, ?)'
-    ).run(
-      crypto.randomUUID(),
-      row.id,
-      nextStatus,
-      `Cotización definitiva aprobada por el administrador: $${finalQuote.toLocaleString('es-CO')} COP.${quoteNotes ? ` ${quoteNotes}` : ''}`,
-      'admin',
-      now
-    );
-
-    createNotification({
-      recipientId: row.student_id as string,
-      requestId: row.id as string,
-      title: `Cotización confirmada · ${row.order_number}`,
-      message: `Tu solicitud ya tiene precio definitivo: $${finalQuote.toLocaleString('es-CO')} COP. Ya puedes ver los datos de pago por Nequi en "Mis cotizaciones" o "Mis pagos".`,
-      type: 'quote_approved',
-    });
-
-    res.json({ ok: true });
-  });
-
-  app.patch('/api/admin/requests/:id/status', requireAdmin, (req, res) => {
-    const row = db.prepare('SELECT * FROM requests WHERE id = ?').get(req.params.id) as
-      | Record<string, unknown>
-      | undefined;
-    if (!row) {
-      res.status(404).json({ error: 'Solicitud no encontrada.' });
-      return;
-    }
-
-    const nextStatus = String(req.body?.status || row.status);
-    if (!VALID_STATUSES.has(nextStatus)) {
-      res.status(400).json({ error: 'Estado de solicitud no válido.' });
-      return;
-    }
-
-    const note = String(req.body?.note || '').trim().slice(0, 1000);
-    const adminPrivateNotes =
-      req.body?.adminPrivateNotes !== undefined
-        ? String(req.body.adminPrivateNotes).slice(0, 3000)
-        : (row.admin_private_notes as string);
-    const infoRequestMessage =
-      req.body?.infoRequestMessage !== undefined
-        ? String(req.body.infoRequestMessage).trim().slice(0, 1500)
-        : (row.info_request_message as string);
-    const priority = ['baja', 'normal', 'alta', 'urgente'].includes(String(req.body?.priority))
-      ? String(req.body.priority)
-      : (row.priority as string);
-
-    const now = new Date().toISOString();
-    const statusChanged = nextStatus !== row.status;
-
-    db.prepare(
-      `UPDATE requests
-       SET status = ?, admin_private_notes = ?, info_request_message = ?, priority = ?, updated_at = ?
-       WHERE id = ?`
-    ).run(nextStatus, adminPrivateNotes, infoRequestMessage, priority, now, row.id);
-
-    if (statusChanged || note) {
-      db.prepare(
-        'INSERT INTO request_status_history (id, request_id, status, note, changed_by, created_at) VALUES (?, ?, ?, ?, ?, ?)'
-      ).run(
-        crypto.randomUUID(),
-        row.id,
-        nextStatus,
-        note || `Estado actualizado a "${nextStatus}".`,
-        'admin',
-        now
-      );
-    }
-
-    if (statusChanged) {
-      const notifyMsg =
-        nextStatus === 'Requiere información' && infoRequestMessage
-          ? `Se requiere información adicional: ${infoRequestMessage}`
-          : `Tu solicitud ${row.order_number} cambió al estado: ${nextStatus}.`;
-
-      createNotification({
-        recipientId: row.student_id as string,
-        requestId: row.id as string,
-        title: `Actualización · ${row.order_number}`,
-        message: notifyMsg,
-        type: 'status_update',
-      });
-    }
-
-    res.json({ ok: true });
-  });
-
-  app.patch('/api/admin/payments/:paymentId/verify', requireAdmin, (req, res) => {
-    const payment = db.prepare('SELECT * FROM payments WHERE id = ?').get(req.params.paymentId) as
-      | Record<string, unknown>
-      | undefined;
-    if (!payment) {
-      res.status(404).json({ error: 'Registro de pago no encontrado.' });
-      return;
-    }
-
-    const decision = String(req.body?.decision || '');
-    const adminNote = String(req.body?.adminNote || '').trim().slice(0, 800);
-    if (decision !== 'approve' && decision !== 'reject') {
-      res.status(400).json({ error: 'Decisión de verificación inválida.' });
-      return;
-    }
-
-    const requestRow = db.prepare('SELECT * FROM requests WHERE id = ?').get(payment.request_id) as
-      | Record<string, unknown>
-      | undefined;
-    if (!requestRow) {
-      res.status(404).json({ error: 'Solicitud asociada no encontrada.' });
-      return;
-    }
-
-    const now = new Date().toISOString();
-
-    if (decision === 'approve') {
-      db.prepare(
-        "UPDATE payments SET status = 'Pago confirmado', admin_note = ?, verified_at = ? WHERE id = ?"
-      ).run(adminNote, now, payment.id);
-
-      const currentStatus = String(requestRow.status);
-      const nextStatus = ['Solicitud recibida', 'En revisión', 'Cotización enviada', 'Esperando pago', 'Pago pendiente de verificación'].includes(
-        currentStatus
-      )
-        ? 'Pago confirmado'
-        : currentStatus;
-
-      db.prepare(
-        "UPDATE requests SET payment_status = 'Pago confirmado', status = ?, updated_at = ? WHERE id = ?"
-      ).run(nextStatus, now, requestRow.id);
-
-      db.prepare(
-        'INSERT INTO request_status_history (id, request_id, status, note, changed_by, created_at) VALUES (?, ?, ?, ?, ?, ?)'
-      ).run(
-        crypto.randomUUID(),
-        requestRow.id,
+      const inProgressStatuses = new Set([
         'Pago confirmado',
-        `Pago por $${Number(payment.amount).toLocaleString('es-CO')} COP verificado personalmente en Nequi.${adminNote ? ` ${adminNote}` : ''}`,
-        'admin',
-        now
-      );
+        'En cola',
+        'En desarrollo',
+        'En revisión de calidad',
+      ]);
+      const completedStatuses = new Set([
+        'Trabajo finalizado',
+        'Disponible para descarga',
+        'Entregado',
+      ]);
+      const inProgress = allRequests.filter((r) => inProgressStatuses.has(r.status)).length;
+      const completed = allRequests.filter((r) => completedStatuses.has(r.status)).length;
+      const canceled = allRequests.filter((r) => r.status === 'Cancelado').length;
 
-      createNotification({
-        recipientId: requestRow.student_id as string,
-        requestId: requestRow.id as string,
-        title: `Pago confirmado · ${requestRow.order_number}`,
-        message: 'Tu pago por Nequi fue verificado y confirmado. Tu trabajo pasa a cola de desarrollo.',
-        type: 'payment_confirmed',
+      let dailyIncome = 0;
+      let weeklyIncome = 0;
+      let monthlyIncome = 0;
+      let annualIncome = 0;
+
+      for (const p of confirmedRows) {
+        const refDate = p.verified_at || p.created_at;
+        if (refDate.startsWith(todayPrefix)) dailyIncome += Number(p.amount);
+        if (refDate >= weekAgoIso) weeklyIncome += Number(p.amount);
+        if (refDate.startsWith(monthPrefix)) monthlyIncome += Number(p.amount);
+        if (refDate.startsWith(yearPrefix)) annualIncome += Number(p.amount);
+      }
+
+      const pendingAmount = allRequests
+        .filter(
+          (r) =>
+            Boolean(r.quote_approved_by_admin) &&
+            (r.payment_status === 'Esperando pago' || r.payment_status === 'En verificación') &&
+            r.status !== 'Cancelado'
+        )
+        .reduce((acc, r) => acc + Number(r.final_quote || 0), 0);
+
+      const avgOrderValue =
+        confirmedRows.length > 0
+          ? Math.round(
+              confirmedRows.reduce((acc, p) => acc + Number(p.amount), 0) / confirmedRows.length
+            )
+          : 0;
+
+      const serviceStats = new Map<string, { serviceType: string; count: number; revenue: number }>();
+      for (const r of allRequests) {
+        const current = serviceStats.get(r.service_type) || {
+          serviceType: r.service_type,
+          count: 0,
+          revenue: 0,
+        };
+        current.count += 1;
+        if (r.payment_status === 'Pago confirmado') {
+          current.revenue += Number(r.final_quote || 0);
+        }
+        serviceStats.set(r.service_type, current);
+      }
+      const topServices = Array.from(serviceStats.values())
+        .sort((a, b) => b.count - a.count)
+        .slice(0, 8);
+
+      res.json({
+        totalUsers,
+        newUsers,
+        totalRequests,
+        pendingQuotes,
+        pendingPayments,
+        confirmedPayments,
+        inProgress,
+        completed,
+        canceled,
+        dailyIncome,
+        weeklyIncome,
+        monthlyIncome,
+        annualIncome,
+        pendingAmount,
+        avgOrderValue,
+        topServices,
       });
-    } else {
-      db.prepare(
-        "UPDATE payments SET status = 'Pago rechazado', admin_note = ?, verified_at = ? WHERE id = ?"
-      ).run(adminNote || 'Comprobante no verificado.', now, payment.id);
+    })
+  );
 
-      db.prepare(
-        "UPDATE requests SET payment_status = 'Pago rechazado', status = 'Esperando pago', updated_at = ? WHERE id = ?"
-      ).run(now, requestRow.id);
+  app.get(
+    '/api/admin/users',
+    requireAdmin,
+    asyncRoute(async (_req, res) => {
+      const [users, requests, payments] = await Promise.all([
+        store.listAllUsers(),
+        store.listRequests(),
+        store.listPayments({}),
+      ]);
 
-      db.prepare(
-        'INSERT INTO request_status_history (id, request_id, status, note, changed_by, created_at) VALUES (?, ?, ?, ?, ?, ?)'
-      ).run(
-        crypto.randomUUID(),
-        requestRow.id,
-        'Esperando pago',
-        `Pago rechazado por el administrador.${adminNote ? ` Motivo: ${adminNote}` : ''}`,
-        'admin',
-        now
-      );
+      const reqCounts = new Map<string, number>();
+      for (const r of requests) {
+        reqCounts.set(r.student_id, (reqCounts.get(r.student_id) || 0) + 1);
+      }
 
-      createNotification({
-        recipientId: requestRow.student_id as string,
-        requestId: requestRow.id as string,
-        title: `Pago no verificado · ${requestRow.order_number}`,
-        message: `No pudimos confirmar tu comprobante.${adminNote ? ` Motivo: ${adminNote}` : ' Revisa y adjunta un comprobante válido.'}`,
-        type: 'payment_rejected',
+      const paidTotals = new Map<string, number>();
+      for (const p of payments) {
+        if (p.status === 'Pago confirmado') {
+          paidTotals.set(p.student_id, (paidTotals.get(p.student_id) || 0) + Number(p.amount));
+        }
+      }
+
+      res.json({
+        users: users.map((u) => ({
+          id: u.id,
+          email: u.email,
+          name: u.name,
+          phone: u.phone,
+          institution: u.institution,
+          educationLevel: u.education_level,
+          program: u.program,
+          role: u.role,
+          createdAt: u.created_at,
+          requestCount: reqCounts.get(u.id) || 0,
+          totalPaid: paidTotals.get(u.id) || 0,
+        })),
       });
-    }
+    })
+  );
 
-    res.json({ ok: true });
-  });
+  app.get(
+    '/api/admin/payments',
+    requireAdmin,
+    asyncRoute(async (_req, res) => {
+      const rows = await store.listAllPaymentsWithMeta();
+
+      res.json({
+        payments: rows.map((p) => ({
+          ...mapPaymentRow(p),
+          orderNumber: p.order_number,
+          serviceType: p.service_type,
+          studentName: p.student_name,
+          studentEmail: p.student_email,
+          proofFileName: p.proof_file_name,
+        })),
+      });
+    })
+  );
+
+  app.get(
+    '/api/admin/files',
+    requireAdmin,
+    asyncRoute(async (_req, res) => {
+      const rows = await store.listAllFilesWithMeta();
+
+      res.json({
+        files: rows.map((f) => ({
+          ...mapFileRow(f),
+          orderNumber: f.order_number,
+          studentName: f.student_name,
+        })),
+      });
+    })
+  );
+
+  app.patch(
+    '/api/admin/requests/:id/quote',
+    requireAdmin,
+    asyncRoute(async (req, res) => {
+      const row = await store.getRequestById(req.params.id);
+      if (!row) {
+        res.status(404).json({ error: 'Solicitud no encontrada.' });
+        return;
+      }
+
+      const finalQuote = parseInt(String(req.body?.finalQuote || '0'), 10);
+      const quoteNotes = String(req.body?.quoteNotes || '').trim().slice(0, 1500);
+      if (!Number.isFinite(finalQuote) || finalQuote < 1000) {
+        res.status(400).json({ error: 'Ingresa un valor definitivo válido en pesos colombianos.' });
+        return;
+      }
+
+      const now = new Date().toISOString();
+      const nextStatus =
+        row.payment_status === 'Pago confirmado' ? row.status : 'Cotización enviada';
+      const nextPayStatus =
+        row.payment_status === 'Pago confirmado' ? 'Pago confirmado' : 'Esperando pago';
+
+      await store.updateRequest(row.id, {
+        final_quote: finalQuote,
+        quote_approved_by_admin: 1,
+        quote_notes: quoteNotes,
+        status: nextStatus,
+        payment_status: nextPayStatus,
+        updated_at: now,
+      });
+
+      await store.addStatusHistory({
+        id: crypto.randomUUID(),
+        request_id: row.id,
+        status: nextStatus,
+        note: `Cotización definitiva aprobada por el administrador: $${finalQuote.toLocaleString('es-CO')} COP.${quoteNotes ? ` ${quoteNotes}` : ''}`,
+        changed_by: 'admin',
+        created_at: now,
+      });
+
+      await createNotification({
+        recipientId: row.student_id,
+        requestId: row.id,
+        title: `Cotización confirmada · ${row.order_number}`,
+        message: `Tu solicitud ya tiene precio definitivo: $${finalQuote.toLocaleString('es-CO')} COP. Ya puedes ver los datos de pago por Nequi en "Mis cotizaciones" o "Mis pagos".`,
+        type: 'quote_approved',
+      });
+
+      res.json({ ok: true });
+    })
+  );
+
+  app.patch(
+    '/api/admin/requests/:id/status',
+    requireAdmin,
+    asyncRoute(async (req, res) => {
+      const row = await store.getRequestById(req.params.id);
+      if (!row) {
+        res.status(404).json({ error: 'Solicitud no encontrada.' });
+        return;
+      }
+
+      const nextStatus = String(req.body?.status || row.status);
+      if (!VALID_STATUSES.has(nextStatus)) {
+        res.status(400).json({ error: 'Estado de solicitud no válido.' });
+        return;
+      }
+
+      const note = String(req.body?.note || '').trim().slice(0, 1000);
+      const adminPrivateNotes =
+        req.body?.adminPrivateNotes !== undefined
+          ? String(req.body.adminPrivateNotes).slice(0, 3000)
+          : row.admin_private_notes;
+      const infoRequestMessage =
+        req.body?.infoRequestMessage !== undefined
+          ? String(req.body.infoRequestMessage).trim().slice(0, 1500)
+          : row.info_request_message;
+      const priority = ['baja', 'normal', 'alta', 'urgente'].includes(String(req.body?.priority))
+        ? String(req.body.priority)
+        : row.priority;
+
+      const now = new Date().toISOString();
+      const statusChanged = nextStatus !== row.status;
+
+      await store.updateRequest(row.id, {
+        status: nextStatus,
+        admin_private_notes: adminPrivateNotes,
+        info_request_message: infoRequestMessage,
+        priority,
+        updated_at: now,
+      });
+
+      if (statusChanged || note) {
+        await store.addStatusHistory({
+          id: crypto.randomUUID(),
+          request_id: row.id,
+          status: nextStatus,
+          note: note || `Estado actualizado a "${nextStatus}".`,
+          changed_by: 'admin',
+          created_at: now,
+        });
+      }
+
+      if (statusChanged) {
+        const notifyMsg =
+          nextStatus === 'Requiere información' && infoRequestMessage
+            ? `Se requiere información adicional: ${infoRequestMessage}`
+            : `Tu solicitud ${row.order_number} cambió al estado: ${nextStatus}.`;
+
+        await createNotification({
+          recipientId: row.student_id,
+          requestId: row.id,
+          title: `Actualización · ${row.order_number}`,
+          message: notifyMsg,
+          type: 'status_update',
+        });
+      }
+
+      res.json({ ok: true });
+    })
+  );
+
+  app.patch(
+    '/api/admin/payments/:paymentId/verify',
+    requireAdmin,
+    asyncRoute(async (req, res) => {
+      const payment = await store.getPaymentById(req.params.paymentId);
+      if (!payment) {
+        res.status(404).json({ error: 'Registro de pago no encontrado.' });
+        return;
+      }
+
+      const decision = String(req.body?.decision || '');
+      const adminNote = String(req.body?.adminNote || '').trim().slice(0, 800);
+      if (decision !== 'approve' && decision !== 'reject') {
+        res.status(400).json({ error: 'Decisión de verificación inválida.' });
+        return;
+      }
+
+      const requestRow = await store.getRequestById(payment.request_id);
+      if (!requestRow) {
+        res.status(404).json({ error: 'Solicitud asociada no encontrada.' });
+        return;
+      }
+
+      const now = new Date().toISOString();
+
+      if (decision === 'approve') {
+        await store.updatePayment(payment.id, {
+          status: 'Pago confirmado',
+          admin_note: adminNote,
+          verified_at: now,
+        });
+
+        const currentStatus = String(requestRow.status);
+        const nextStatus = [
+          'Solicitud recibida',
+          'En revisión',
+          'Cotización enviada',
+          'Esperando pago',
+          'Pago pendiente de verificación',
+        ].includes(currentStatus)
+          ? 'Pago confirmado'
+          : currentStatus;
+
+        await store.updateRequest(requestRow.id, {
+          payment_status: 'Pago confirmado',
+          status: nextStatus,
+          updated_at: now,
+        });
+
+        await store.addStatusHistory({
+          id: crypto.randomUUID(),
+          request_id: requestRow.id,
+          status: 'Pago confirmado',
+          note: `Pago por $${Number(payment.amount).toLocaleString('es-CO')} COP verificado personalmente en Nequi.${adminNote ? ` ${adminNote}` : ''}`,
+          changed_by: 'admin',
+          created_at: now,
+        });
+
+        await createNotification({
+          recipientId: requestRow.student_id,
+          requestId: requestRow.id,
+          title: `Pago confirmado · ${requestRow.order_number}`,
+          message: 'Tu pago por Nequi fue verificado y confirmado. Tu trabajo pasa a cola de desarrollo.',
+          type: 'payment_confirmed',
+        });
+      } else {
+        await store.updatePayment(payment.id, {
+          status: 'Pago rechazado',
+          admin_note: adminNote || 'Comprobante no verificado.',
+          verified_at: now,
+        });
+
+        await store.updateRequest(requestRow.id, {
+          payment_status: 'Pago rechazado',
+          status: 'Esperando pago',
+          updated_at: now,
+        });
+
+        await store.addStatusHistory({
+          id: crypto.randomUUID(),
+          request_id: requestRow.id,
+          status: 'Esperando pago',
+          note: `Pago rechazado por el administrador.${adminNote ? ` Motivo: ${adminNote}` : ''}`,
+          changed_by: 'admin',
+          created_at: now,
+        });
+
+        await createNotification({
+          recipientId: requestRow.student_id,
+          requestId: requestRow.id,
+          title: `Pago no verificado · ${requestRow.order_number}`,
+          message: `No pudimos confirmar tu comprobante.${adminNote ? ` Motivo: ${adminNote}` : ' Revisa y adjunta un comprobante válido.'}`,
+          type: 'payment_rejected',
+        });
+      }
+
+      res.json({ ok: true });
+    })
+  );
 
   app.post(
     '/api/admin/requests/:id/deliveries',
     requireAdmin,
     upload.array('files', 10),
-    (req, res) => {
-      const requestRow = db.prepare('SELECT * FROM requests WHERE id = ?').get(req.params.id) as
-        | Record<string, unknown>
-        | undefined;
+    asyncRoute(async (req, res) => {
+      const requestRow = await store.getRequestById(req.params.id);
       if (!requestRow) {
         res.status(404).json({ error: 'Solicitud no encontrada.' });
         return;
@@ -1598,468 +1669,520 @@ async function startServer() {
 
       let nextVersion = 1;
       if (replaceFileId) {
-        const prevFile = db
-          .prepare("SELECT id, version FROM files WHERE id = ? AND request_id = ? AND kind = 'delivery'")
-          .get(replaceFileId, requestRow.id) as { id: string; version: number } | undefined;
-        if (prevFile) {
+        const prevFile = await store.getFileById(replaceFileId);
+        if (prevFile && prevFile.request_id === requestRow.id && prevFile.kind === 'delivery') {
           nextVersion = prevFile.version + 1;
-          db.prepare('UPDATE files SET is_latest = 0 WHERE id = ?').run(prevFile.id);
+          await store.updateFileIsLatest(prevFile.id, 0);
         }
       } else {
-        const maxVer = db
-          .prepare("SELECT COALESCE(MAX(version), 0) as maxv FROM files WHERE request_id = ? AND kind = 'delivery'")
-          .get(requestRow.id) as { maxv: number };
-        if (maxVer.maxv > 0) nextVersion = maxVer.maxv + 1;
+        const maxv = await store.getMaxDeliveryVersion(requestRow.id);
+        if (maxv > 0) nextVersion = maxv + 1;
       }
 
-      const insertFile = db.prepare(
-        `INSERT INTO files (
-          id, request_id, owner_id, kind, original_name, stored_name, mime_type,
-          format_label, size_bytes, version, is_latest, replaced_file_id, uploaded_by_role, created_at
-        ) VALUES (?, ?, ?, 'delivery', ?, ?, ?, ?, ?, ?, 1, ?, 'admin', ?)`
-      );
-
       for (const file of uploadedFiles) {
-        insertFile.run(
-          crypto.randomUUID(),
-          requestRow.id,
-          requestRow.student_id,
-          file.originalname.slice(0, 200),
-          file.filename,
-          file.mimetype || 'application/octet-stream',
-          formatLabelFromFilename(file.originalname),
-          file.size,
-          nextVersion,
-          replaceFileId,
-          now
-        );
+        const storedName = await persistUploadedFile(file);
+        await store.createFile({
+          id: crypto.randomUUID(),
+          request_id: requestRow.id,
+          owner_id: requestRow.student_id,
+          kind: 'delivery',
+          original_name: file.originalname.slice(0, 200),
+          stored_name: storedName,
+          mime_type: file.mimetype || 'application/octet-stream',
+          format_label: formatLabelFromFilename(file.originalname),
+          size_bytes: file.size,
+          version: nextVersion,
+          is_latest: 1,
+          replaced_file_id: replaceFileId,
+          uploaded_by_role: 'admin',
+          created_at: now,
+        });
       }
 
       const nextStatus =
         requestRow.status === 'Entregado' ? 'Entregado' : 'Disponible para descarga';
 
-      db.prepare('UPDATE requests SET status = ?, updated_at = ? WHERE id = ?').run(
-        nextStatus,
-        now,
-        requestRow.id
-      );
+      await store.updateRequest(requestRow.id, { status: nextStatus, updated_at: now });
 
-      db.prepare(
-        'INSERT INTO request_status_history (id, request_id, status, note, changed_by, created_at) VALUES (?, ?, ?, ?, ?, ?)'
-      ).run(
-        crypto.randomUUID(),
-        requestRow.id,
-        nextStatus,
-        deliveryNote ||
+      await store.addStatusHistory({
+        id: crypto.randomUUID(),
+        request_id: requestRow.id,
+        status: nextStatus,
+        note:
+          deliveryNote ||
           `Entrega versión v${nextVersion}: ${uploadedFiles.map((f) => f.originalname).join(', ')}`,
-        'admin',
-        now
-      );
+        changed_by: 'admin',
+        created_at: now,
+      });
 
-      createNotification({
-        recipientId: requestRow.student_id as string,
-        requestId: requestRow.id as string,
+      await createNotification({
+        recipientId: requestRow.student_id,
+        requestId: requestRow.id,
         title: `Documentos listos · ${requestRow.order_number}`,
         message: `Se subió la entrega (v${nextVersion}) de tu solicitud. Ya puedes descargar tus archivos desde "Mis documentos".`,
         type: 'delivery_ready',
       });
 
       res.status(201).json({ ok: true, version: nextVersion });
-    }
+    })
   );
 
   // ---------------- ADMIN CATALOG, RATES & SETTINGS ----------------
-  app.get('/api/admin/catalog', requireAdmin, (_req, res) => {
-    const services = db
-      .prepare('SELECT * FROM catalog_services ORDER BY sort_order ASC')
-      .all() as Array<Record<string, unknown>>;
-    res.json({
-      services: services.map((s) => ({
-        id: s.id,
-        category: s.category,
-        name: s.name,
-        description: s.description,
-        basePrice: Number(s.base_price),
-        active: Boolean(s.active),
-      })),
-    });
-  });
+  app.get(
+    '/api/admin/catalog',
+    requireAdmin,
+    asyncRoute(async (_req, res) => {
+      const services = await store.getCatalogServices(false);
+      res.json({
+        services: services.map((s) => ({
+          id: s.id,
+          category: s.category,
+          name: s.name,
+          description: s.description,
+          basePrice: Number(s.base_price),
+          active: Boolean(s.active),
+        })),
+      });
+    })
+  );
 
-  app.post('/api/admin/catalog', requireAdmin, (req, res) => {
-    const category = String(req.body?.category || '').trim().slice(0, 80);
-    const name = String(req.body?.name || '').trim().slice(0, 120);
-    const description = String(req.body?.description || '').trim().slice(0, 400);
-    const basePrice = Math.max(5000, parseInt(String(req.body?.basePrice || '20000'), 10) || 20000);
-    if (!category || !name) {
-      res.status(400).json({ error: 'Categoría y nombre son obligatorios.' });
-      return;
-    }
-    const maxOrder = (
-      db.prepare('SELECT COALESCE(MAX(sort_order), 0) as m FROM catalog_services').get() as { m: number }
-    ).m;
-    const id = crypto.randomUUID();
-    db.prepare(
-      'INSERT INTO catalog_services (id, category, name, description, base_price, active, sort_order) VALUES (?, ?, ?, ?, ?, 1, ?)'
-    ).run(id, category, name, description || `Apoyo académico en ${name}.`, basePrice, maxOrder + 1);
-    res.status(201).json({ ok: true, id });
-  });
+  app.post(
+    '/api/admin/catalog',
+    requireAdmin,
+    asyncRoute(async (req, res) => {
+      const category = String(req.body?.category || '').trim().slice(0, 80);
+      const name = String(req.body?.name || '').trim().slice(0, 120);
+      const description = String(req.body?.description || '').trim().slice(0, 400);
+      const basePrice = Math.max(5000, parseInt(String(req.body?.basePrice || '20000'), 10) || 20000);
+      if (!category || !name) {
+        res.status(400).json({ error: 'Categoría y nombre son obligatorios.' });
+        return;
+      }
+      const maxOrder = await store.getMaxCatalogSortOrder();
+      const id = crypto.randomUUID();
+      await store.createCatalogService({
+        id,
+        category,
+        name,
+        description: description || `Apoyo académico en ${name}.`,
+        base_price: basePrice,
+        active: 1,
+        sort_order: maxOrder + 1,
+      });
+      res.status(201).json({ ok: true, id });
+    })
+  );
 
-  app.patch('/api/admin/catalog/:id', requireAdmin, (req, res) => {
-    const existing = db.prepare('SELECT * FROM catalog_services WHERE id = ?').get(req.params.id) as
-      | Record<string, unknown>
-      | undefined;
-    if (!existing) {
-      res.status(404).json({ error: 'Servicio no encontrado.' });
-      return;
-    }
-    const name = String(req.body?.name ?? existing.name).trim().slice(0, 120);
-    const description = String(req.body?.description ?? existing.description).trim().slice(0, 400);
-    const basePrice = Math.max(
-      5000,
-      parseInt(String(req.body?.basePrice ?? existing.base_price), 10) || Number(existing.base_price)
-    );
-    const active = req.body?.active !== undefined ? (req.body.active ? 1 : 0) : Number(existing.active);
-    db.prepare(
-      'UPDATE catalog_services SET name = ?, description = ?, base_price = ?, active = ? WHERE id = ?'
-    ).run(name, description, basePrice, active, req.params.id);
-    res.json({ ok: true });
-  });
+  app.patch(
+    '/api/admin/catalog/:id',
+    requireAdmin,
+    asyncRoute(async (req, res) => {
+      const existing = await store.getCatalogServiceById(req.params.id);
+      if (!existing) {
+        res.status(404).json({ error: 'Servicio no encontrado.' });
+        return;
+      }
+      const name = String(req.body?.name ?? existing.name).trim().slice(0, 120);
+      const description = String(req.body?.description ?? existing.description).trim().slice(0, 400);
+      const basePrice = Math.max(
+        5000,
+        parseInt(String(req.body?.basePrice ?? existing.base_price), 10) || Number(existing.base_price)
+      );
+      const active = req.body?.active !== undefined ? (req.body.active ? 1 : 0) : Number(existing.active);
+      await store.updateCatalogService(req.params.id, {
+        name,
+        description,
+        base_price: basePrice,
+        active,
+      });
+      res.json({ ok: true });
+    })
+  );
 
-  app.patch('/api/admin/rates/:id', requireAdmin, (req, res) => {
-    const existing = db.prepare('SELECT * FROM rates WHERE id = ?').get(req.params.id) as
-      | Record<string, unknown>
-      | undefined;
-    if (!existing) {
-      res.status(404).json({ error: 'Tarifa no encontrada.' });
-      return;
-    }
-    const serviceName = String(req.body?.serviceName ?? existing.service_name).trim().slice(0, 120);
-    const basePrice = Math.max(
-      1000,
-      parseInt(String(req.body?.basePrice ?? existing.base_price), 10) || Number(existing.base_price)
-    );
-    const isStartingFrom =
-      req.body?.isStartingFrom !== undefined
-        ? req.body.isStartingFrom
-          ? 1
-          : 0
-        : Number(existing.is_starting_from);
-    const notes = String(req.body?.notes ?? existing.notes).trim().slice(0, 300);
-    const now = new Date().toISOString();
+  app.patch(
+    '/api/admin/rates/:id',
+    requireAdmin,
+    asyncRoute(async (req, res) => {
+      const existing = await store.getRateById(req.params.id);
+      if (!existing) {
+        res.status(404).json({ error: 'Tarifa no encontrada.' });
+        return;
+      }
+      const serviceName = String(req.body?.serviceName ?? existing.service_name).trim().slice(0, 120);
+      const basePrice = Math.max(
+        1000,
+        parseInt(String(req.body?.basePrice ?? existing.base_price), 10) || Number(existing.base_price)
+      );
+      const isStartingFrom =
+        req.body?.isStartingFrom !== undefined
+          ? req.body.isStartingFrom
+            ? 1
+            : 0
+          : Number(existing.is_starting_from);
+      const notes = String(req.body?.notes ?? existing.notes).trim().slice(0, 300);
+      const now = new Date().toISOString();
 
-    db.prepare(
-      'UPDATE rates SET service_name = ?, base_price = ?, is_starting_from = ?, notes = ?, updated_at = ? WHERE id = ?'
-    ).run(serviceName, basePrice, isStartingFrom, notes, now, req.params.id);
-    res.json({ ok: true });
-  });
+      await store.updateRate(req.params.id, {
+        service_name: serviceName,
+        base_price: basePrice,
+        is_starting_from: isStartingFrom,
+        notes,
+        updated_at: now,
+      });
+      res.json({ ok: true });
+    })
+  );
 
-  app.post('/api/admin/rates', requireAdmin, (req, res) => {
-    const serviceName = String(req.body?.serviceName || '').trim().slice(0, 120);
-    const basePrice = Math.max(1000, parseInt(String(req.body?.basePrice || '20000'), 10) || 20000);
-    const isStartingFrom = req.body?.isStartingFrom ? 1 : 0;
-    const notes = String(req.body?.notes || '').trim().slice(0, 300);
-    if (!serviceName) {
-      res.status(400).json({ error: 'El nombre del servicio es obligatorio.' });
-      return;
-    }
-    const maxOrder = (db.prepare('SELECT COALESCE(MAX(sort_order), 0) as m FROM rates').get() as { m: number }).m;
-    const now = new Date().toISOString();
-    db.prepare(
-      'INSERT INTO rates (id, service_name, base_price, is_starting_from, notes, updated_at, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)'
-    ).run(crypto.randomUUID(), serviceName, basePrice, isStartingFrom, notes, now, maxOrder + 1);
-    res.status(201).json({ ok: true });
-  });
+  app.post(
+    '/api/admin/rates',
+    requireAdmin,
+    asyncRoute(async (req, res) => {
+      const serviceName = String(req.body?.serviceName || '').trim().slice(0, 120);
+      const basePrice = Math.max(1000, parseInt(String(req.body?.basePrice || '20000'), 10) || 20000);
+      const isStartingFrom = req.body?.isStartingFrom ? 1 : 0;
+      const notes = String(req.body?.notes || '').trim().slice(0, 300);
+      if (!serviceName) {
+        res.status(400).json({ error: 'El nombre del servicio es obligatorio.' });
+        return;
+      }
+      const maxOrder = await store.getMaxRateSortOrder();
+      const now = new Date().toISOString();
+      await store.createRate({
+        id: crypto.randomUUID(),
+        service_name: serviceName,
+        base_price: basePrice,
+        is_starting_from: isStartingFrom,
+        notes,
+        updated_at: now,
+        sort_order: maxOrder + 1,
+      });
+      res.status(201).json({ ok: true });
+    })
+  );
 
-  app.get('/api/admin/settings', requireAdmin, (_req, res) => {
-    res.json({
-      nequiNumber: getSetting('nequi_number', '3204236962'),
-      nequiHolder: getSetting('nequi_holder', 'AulaPro AI'),
-      paymentInstructions: getSetting('payment_instructions', ''),
-      officialGatewayStatus: getSetting('official_gateway_status', 'pending_config'),
-      businessEmail: getSetting('business_email', ''),
-      welcomeNote: getSetting('welcome_note', ''),
-    });
-  });
+  app.get(
+    '/api/admin/settings',
+    requireAdmin,
+    asyncRoute(async (_req, res) => {
+      const [
+        nequiNumber,
+        nequiHolder,
+        paymentInstructions,
+        officialGatewayStatus,
+        businessEmail,
+        welcomeNote,
+      ] = await Promise.all([
+        getSetting('nequi_number', '3204236962'),
+        getSetting('nequi_holder', 'AulaPro AI'),
+        getSetting('payment_instructions', ''),
+        getSetting('official_gateway_status', 'pending_config'),
+        getSetting('business_email', ''),
+        getSetting('welcome_note', ''),
+      ]);
+      res.json({
+        nequiNumber,
+        nequiHolder,
+        paymentInstructions,
+        officialGatewayStatus,
+        businessEmail,
+        welcomeNote,
+      });
+    })
+  );
 
-  app.patch('/api/admin/settings', requireAdmin, (req, res) => {
-    if (req.body?.nequiNumber !== undefined) {
-      setSetting('nequi_number', String(req.body.nequiNumber).trim().slice(0, 30));
-    }
-    if (req.body?.nequiHolder !== undefined) {
-      setSetting('nequi_holder', String(req.body.nequiHolder).trim().slice(0, 80));
-    }
-    if (req.body?.paymentInstructions !== undefined) {
-      setSetting('payment_instructions', String(req.body.paymentInstructions).trim().slice(0, 2000));
-    }
-    if (req.body?.businessEmail !== undefined) {
-      setSetting('business_email', String(req.body.businessEmail).trim().slice(0, 120));
-    }
-    if (req.body?.welcomeNote !== undefined) {
-      setSetting('welcome_note', String(req.body.welcomeNote).trim().slice(0, 500));
-    }
-    res.json({ ok: true });
-  });
+  app.patch(
+    '/api/admin/settings',
+    requireAdmin,
+    asyncRoute(async (req, res) => {
+      if (req.body?.nequiNumber !== undefined) {
+        await setSetting('nequi_number', String(req.body.nequiNumber).trim().slice(0, 30));
+      }
+      if (req.body?.nequiHolder !== undefined) {
+        await setSetting('nequi_holder', String(req.body.nequiHolder).trim().slice(0, 80));
+      }
+      if (req.body?.paymentInstructions !== undefined) {
+        await setSetting('payment_instructions', String(req.body.paymentInstructions).trim().slice(0, 2000));
+      }
+      if (req.body?.businessEmail !== undefined) {
+        await setSetting('business_email', String(req.body.businessEmail).trim().slice(0, 120));
+      }
+      if (req.body?.welcomeNote !== undefined) {
+        await setSetting('welcome_note', String(req.body.welcomeNote).trim().slice(0, 500));
+      }
+      res.json({ ok: true });
+    })
+  );
 
-  app.get('/api/admin/reviews', requireAdmin, (_req, res) => {
-    const rows = db
-      .prepare(
-        `SELECT rv.*, r.order_number, u.name as student_full_name, u.email as student_email
-         FROM reviews rv
-         JOIN requests r ON r.id = rv.request_id
-         JOIN users u ON u.id = rv.student_id
-         ORDER BY rv.created_at DESC`
-      )
-      .all() as Array<Record<string, unknown>>;
+  app.get(
+    '/api/admin/reviews',
+    requireAdmin,
+    asyncRoute(async (_req, res) => {
+      const rows = await store.listAllReviewsWithMeta();
 
-    res.json({
-      reviews: rows.map((rv) => ({
-        id: rv.id,
-        requestId: rv.request_id,
-        orderNumber: rv.order_number,
-        studentId: rv.student_id,
-        studentDisplayName: rv.student_display_name,
-        studentFullName: rv.student_full_name,
-        studentEmail: rv.student_email,
-        serviceType: rv.service_type,
-        educationLevel: rv.education_level,
-        rating: Number(rv.rating),
-        comment: rv.comment,
-        isVisible: Boolean(rv.is_visible),
-        adminReply: rv.admin_reply,
-        createdAt: rv.created_at,
-      })),
-    });
-  });
+      res.json({
+        reviews: rows.map((rv) => ({
+          ...mapReviewRow(rv),
+          orderNumber: rv.order_number,
+          studentFullName: rv.student_full_name,
+          studentEmail: rv.student_email,
+        })),
+      });
+    })
+  );
 
-  app.patch('/api/admin/reviews/:id', requireAdmin, (req, res) => {
-    const existing = db.prepare('SELECT * FROM reviews WHERE id = ?').get(req.params.id) as
-      | Record<string, unknown>
-      | undefined;
-    if (!existing) {
-      res.status(404).json({ error: 'Calificación no encontrada.' });
-      return;
-    }
+  app.patch(
+    '/api/admin/reviews/:id',
+    requireAdmin,
+    asyncRoute(async (req, res) => {
+      const existing = await store.getReviewById(req.params.id);
+      if (!existing) {
+        res.status(404).json({ error: 'Calificación no encontrada.' });
+        return;
+      }
 
-    const isVisible =
-      req.body?.isVisible !== undefined ? (req.body.isVisible ? 1 : 0) : Number(existing.is_visible);
-    const adminReply =
-      req.body?.adminReply !== undefined
-        ? String(req.body.adminReply).trim().slice(0, 500)
-        : String(existing.admin_reply);
+      const isVisible =
+        req.body?.isVisible !== undefined ? (req.body.isVisible ? 1 : 0) : Number(existing.is_visible);
+      const adminReply =
+        req.body?.adminReply !== undefined
+          ? String(req.body.adminReply).trim().slice(0, 500)
+          : String(existing.admin_reply);
 
-    db.prepare('UPDATE reviews SET is_visible = ?, admin_reply = ? WHERE id = ?').run(
-      isVisible,
-      adminReply,
-      req.params.id
-    );
-    res.json({ ok: true });
-  });
+      await store.updateReview(req.params.id, {
+        is_visible: isVisible,
+        admin_reply: adminReply,
+      });
+      res.json({ ok: true });
+    })
+  );
 
-  app.get('/api/admin/reports/export', requireAdmin, (_req, res) => {
-    const requests = db
-      .prepare(
-        `SELECT r.order_number as Pedido, r.created_at as Fecha, u.name as Estudiante, u.email as Correo,
-                r.education_level as Nivel, r.subject as Materia, r.service_type as Servicio,
-                r.preliminary_quote as Cotizacion_Preliminar_COP, r.final_quote as Cotizacion_Final_COP,
-                r.payment_status as Estado_Pago, r.status as Estado_Trabajo, r.deadline as Fecha_Limite
-         FROM requests r
-         JOIN users u ON u.id = r.student_id
-         ORDER BY r.created_at DESC`
-      )
-      .all();
+  app.get(
+    '/api/admin/reports/export',
+    requireAdmin,
+    asyncRoute(async (_req, res) => {
+      const [reqRows, payRows] = await Promise.all([
+        store.listRequests(),
+        store.listAllPaymentsWithMeta(),
+      ]);
 
-    const payments = db
-      .prepare(
-        `SELECT p.id as ID_Pago, r.order_number as Pedido, u.name as Estudiante, p.method as Metodo,
-                p.nequi_destination as Nequi_Destino, p.amount as Valor_COP, p.reference_code as Referencia,
-                p.status as Estado, p.created_at as Fecha_Registro, p.verified_at as Fecha_Verificacion
-         FROM payments p
-         JOIN requests r ON r.id = p.request_id
-         JOIN users u ON u.id = p.student_id
-         ORDER BY p.created_at DESC`
-      )
-      .all();
+      const requests = reqRows.map((r) => ({
+        Pedido: r.order_number,
+        Fecha: r.created_at,
+        Estudiante: r.student_name || '',
+        Correo: r.student_email || '',
+        Nivel: r.education_level,
+        Materia: r.subject,
+        Servicio: r.service_type,
+        Cotizacion_Preliminar_COP: Number(r.preliminary_quote),
+        Cotizacion_Final_COP: r.final_quote !== null ? Number(r.final_quote) : null,
+        Estado_Pago: r.payment_status,
+        Estado_Trabajo: r.status,
+        Fecha_Limite: r.deadline,
+      }));
 
-    const wb = XLSX.utils.book_new();
-    const wsReq = XLSX.utils.json_to_sheet(requests);
-    const wsPay = XLSX.utils.json_to_sheet(payments);
-    XLSX.utils.book_append_sheet(wb, wsReq, 'Solicitudes');
-    XLSX.utils.book_append_sheet(wb, wsPay, 'Pagos');
+      const payments = payRows.map((p) => ({
+        ID_Pago: p.id,
+        Pedido: p.order_number,
+        Estudiante: p.student_name,
+        Metodo: p.method,
+        Nequi_Destino: p.nequi_destination,
+        Valor_COP: Number(p.amount),
+        Referencia: p.reference_code,
+        Estado: p.status,
+        Fecha_Registro: p.created_at,
+        Fecha_Verificacion: p.verified_at,
+      }));
 
-    const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
-    const filename = `AulaPro_AI_Reporte_${new Date().toISOString().slice(0, 10)}.xlsx`;
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    res.send(buffer);
-  });
+      const wb = XLSX.utils.book_new();
+      const wsReq = XLSX.utils.json_to_sheet(requests);
+      const wsPay = XLSX.utils.json_to_sheet(payments);
+      XLSX.utils.book_append_sheet(wb, wsReq, 'Solicitudes');
+      XLSX.utils.book_append_sheet(wb, wsPay, 'Pagos');
+
+      const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+      const filename = `AulaPro_AI_Reporte_${new Date().toISOString().slice(0, 10)}.xlsx`;
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      res.send(buffer);
+    })
+  );
 
   // ---------------- AULAPRO ASSISTANT AI ROUTES ----------------
-  app.get('/api/ai/history', requireAuth, (req: AuthedRequest, res) => {
-    const rows = db
-      .prepare('SELECT id, role, context_request_id, content, created_at FROM ai_messages WHERE user_id = ? ORDER BY created_at ASC LIMIT 60')
-      .all(req.user!.id) as Array<Record<string, unknown>>;
+  app.get(
+    '/api/ai/history',
+    requireAuth,
+    asyncRoute(async (req, res) => {
+      const rows = await store.listAiMessages(req.user!.id, 60);
 
-    res.json({
-      messages: rows.map((m) => ({
-        id: m.id,
-        role: m.role,
-        contextRequestId: m.context_request_id,
-        content: m.content,
-        createdAt: m.created_at,
-      })),
-    });
-  });
-
-  app.delete('/api/ai/history', requireAuth, (req: AuthedRequest, res) => {
-    db.prepare('DELETE FROM ai_messages WHERE user_id = ?').run(req.user!.id);
-    res.json({ ok: true });
-  });
-
-  app.post('/api/ai/student-chat', requireAuth, async (req: AuthedRequest, res) => {
-    const user = req.user!;
-    const message = String(req.body?.message || '').trim().slice(0, 3000);
-    if (!message) {
-      res.status(400).json({ error: 'Escribe un mensaje para consultar a AulaPro Assistant.' });
-      return;
-    }
-
-    const historyRows = db
-      .prepare('SELECT role, content FROM ai_messages WHERE user_id = ? ORDER BY created_at ASC LIMIT 20')
-      .all(user.id) as Array<{ role: 'user' | 'assistant'; content: string }>;
-
-    const userRequests = db
-      .prepare(
-        'SELECT order_number, subject, service_type, status, payment_status, preliminary_quote, final_quote FROM requests WHERE student_id = ? ORDER BY created_at DESC LIMIT 8'
-      )
-      .all(user.id) as Array<Record<string, unknown>>;
-
-    const requestsSummary =
-      userRequests.length === 0
-        ? 'El estudiante aún no ha creado solicitudes.'
-        : userRequests
-            .map(
-              (r) =>
-                `- ${r.order_number}: ${r.service_type} (${r.subject}) | Estado: ${r.status} | Pago: ${r.payment_status} | Preliminar: $${Number(r.preliminary_quote).toLocaleString('es-CO')} COP | Final: ${r.final_quote ? `$${Number(r.final_quote).toLocaleString('es-CO')} COP` : 'Pendiente'}`
-            )
-            .join('\n');
-
-    try {
-      const reply = await askStudentAssistant({
-        message,
-        history: historyRows,
-        studentName: user.name,
-        requestsSummary,
+      res.json({
+        messages: rows.map((m) => ({
+          id: m.id,
+          role: m.role,
+          contextRequestId: m.context_request_id,
+          content: m.content,
+          createdAt: m.created_at,
+        })),
       });
+    })
+  );
 
-      const now = new Date().toISOString();
-      const userMsgId = crypto.randomUUID();
-      const aiMsgId = crypto.randomUUID();
+  app.delete(
+    '/api/ai/history',
+    requireAuth,
+    asyncRoute(async (req, res) => {
+      await store.deleteAiMessages(req.user!.id);
+      res.json({ ok: true });
+    })
+  );
 
-      db.prepare(
-        'INSERT INTO ai_messages (id, user_id, role, context_request_id, content, created_at) VALUES (?, ?, ?, NULL, ?, ?)'
-      ).run(userMsgId, user.id, 'user', message, now);
-      db.prepare(
-        'INSERT INTO ai_messages (id, user_id, role, context_request_id, content, created_at) VALUES (?, ?, ?, NULL, ?, ?)'
-      ).run(aiMsgId, user.id, 'assistant', reply, new Date(Date.now() + 5).toISOString());
-
-      res.json({ reply });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Error al consultar AulaPro Assistant.';
-      res.status(502).json({ error: msg });
-    }
-  });
-
-  app.post('/api/ai/admin-analyze', requireAdmin, async (req: AuthedRequest, res) => {
-    const user = req.user!;
-    const message = String(req.body?.message || '').trim().slice(0, 3000);
-    const requestId = req.body?.requestId ? String(req.body.requestId) : null;
-
-    if (!message) {
-      res.status(400).json({ error: 'Escribe una instrucción o pregunta para AulaPro Assistant.' });
-      return;
-    }
-
-    let requestContext = null;
-    if (requestId) {
-      const r = db.prepare('SELECT * FROM requests WHERE id = ?').get(requestId) as
-        | Record<string, unknown>
-        | undefined;
-      if (r) {
-        const files = db
-          .prepare("SELECT original_name, stored_name, mime_type, size_bytes FROM files WHERE request_id = ? AND kind = 'attachment'")
-          .all(r.id) as Array<{
-          original_name: string;
-          stored_name: string;
-          mime_type: string;
-          size_bytes: number;
-        }>;
-        requestContext = {
-          orderNumber: r.order_number as string,
-          subject: r.subject as string,
-          educationLevel: r.education_level as string,
-          serviceType: r.service_type as string,
-          description: r.description as string,
-          pages: Number(r.pages),
-          exercises: Number(r.exercises),
-          slides: Number(r.slides),
-          deadline: r.deadline as string,
-          requestedFormat: r.requested_format as string,
-          additionalNotes: r.additional_notes as string,
-          preliminaryQuote: Number(r.preliminary_quote),
-          files: files.map((f) => ({
-            originalName: f.original_name,
-            storedName: f.stored_name,
-            mimeType: f.mime_type,
-            sizeBytes: Number(f.size_bytes),
-          })),
-        };
+  app.post(
+    '/api/ai/student-chat',
+    requireAuth,
+    asyncRoute(async (req, res) => {
+      const user = req.user!;
+      const message = String(req.body?.message || '').trim().slice(0, 3000);
+      if (!message) {
+        res.status(400).json({ error: 'Escribe un mensaje para consultar a AulaPro Assistant.' });
+        return;
       }
-    }
 
-    const rates = db.prepare('SELECT service_name, base_price, is_starting_from FROM rates ORDER BY sort_order ASC').all() as Array<{
-      service_name: string;
-      base_price: number;
-      is_starting_from: number;
-    }>;
-    const ratesContext = rates
-      .map((rt) => `- ${rt.service_name}: ${rt.is_starting_from ? 'Desde ' : ''}$${rt.base_price.toLocaleString('es-CO')} COP`)
-      .join('\n');
+      const [historyRows, userRequests] = await Promise.all([
+        store.listAiMessages(user.id, 20),
+        store.listRequests(user.id),
+      ]);
 
-    const historyRows = db
-      .prepare('SELECT role, content FROM ai_messages WHERE user_id = ? ORDER BY created_at ASC LIMIT 16')
-      .all(user.id) as Array<{ role: 'user' | 'assistant'; content: string }>;
+      const requestsSummary =
+        userRequests.length === 0
+          ? 'El estudiante aún no ha creado solicitudes.'
+          : userRequests
+              .slice(0, 8)
+              .map(
+                (r) =>
+                  `- ${r.order_number}: ${r.service_type} (${r.subject}) | Estado: ${r.status} | Pago: ${r.payment_status} | Preliminar: $${Number(r.preliminary_quote).toLocaleString('es-CO')} COP | Final: ${r.final_quote ? `$${Number(r.final_quote).toLocaleString('es-CO')} COP` : 'Pendiente'}`
+              )
+              .join('\n');
 
-    try {
-      const reply = await askAdminAssistant({
-        message,
-        history: historyRows,
-        requestContext,
-        ratesContext,
-      });
+      try {
+        const reply = await askStudentAssistant({
+          message,
+          history: historyRows.map((m) => ({ role: m.role, content: m.content })),
+          studentName: user.name,
+          requestsSummary,
+        });
 
-      const now = new Date().toISOString();
-      db.prepare(
-        'INSERT INTO ai_messages (id, user_id, role, context_request_id, content, created_at) VALUES (?, ?, ?, ?, ?, ?)'
-      ).run(crypto.randomUUID(), user.id, 'user', requestId, message, now);
-      db.prepare(
-        'INSERT INTO ai_messages (id, user_id, role, context_request_id, content, created_at) VALUES (?, ?, ?, ?, ?, ?)'
-      ).run(
-        crypto.randomUUID(),
-        user.id,
-        'assistant',
-        requestId,
-        reply,
-        new Date(Date.now() + 5).toISOString()
-      );
+        const now = new Date().toISOString();
+        await store.createAiMessage({
+          id: crypto.randomUUID(),
+          user_id: user.id,
+          role: 'user',
+          context_request_id: null,
+          content: message,
+          created_at: now,
+        });
+        await store.createAiMessage({
+          id: crypto.randomUUID(),
+          user_id: user.id,
+          role: 'assistant',
+          context_request_id: null,
+          content: reply,
+          created_at: new Date(Date.now() + 5).toISOString(),
+        });
 
-      res.json({ reply });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Error al consultar AulaPro Assistant.';
-      res.status(502).json({ error: msg });
-    }
-  });
+        res.json({ reply });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Error al consultar AulaPro Assistant.';
+        res.status(502).json({ error: msg });
+      }
+    })
+  );
 
-  // Error handler for multer & upload errors
+  app.post(
+    '/api/ai/admin-analyze',
+    requireAdmin,
+    asyncRoute(async (req, res) => {
+      const user = req.user!;
+      const message = String(req.body?.message || '').trim().slice(0, 3000);
+      const requestId = req.body?.requestId ? String(req.body.requestId) : null;
+
+      if (!message) {
+        res.status(400).json({ error: 'Escribe una instrucción o pregunta para AulaPro Assistant.' });
+        return;
+      }
+
+      let requestContext = null;
+      if (requestId) {
+        const r = await store.getRequestById(requestId);
+        if (r) {
+          const files = await store.listFilesByRequest(r.id, 'attachment');
+          requestContext = {
+            orderNumber: r.order_number,
+            subject: r.subject,
+            educationLevel: r.education_level,
+            serviceType: r.service_type,
+            description: r.description,
+            pages: Number(r.pages),
+            exercises: Number(r.exercises),
+            slides: Number(r.slides),
+            deadline: r.deadline,
+            requestedFormat: r.requested_format,
+            additionalNotes: r.additional_notes,
+            preliminaryQuote: Number(r.preliminary_quote),
+            files: files.map((f) => ({
+              originalName: f.original_name,
+              storedName: f.stored_name,
+              mimeType: f.mime_type,
+              sizeBytes: Number(f.size_bytes),
+            })),
+          };
+        }
+      }
+
+      const [rates, historyRows] = await Promise.all([
+        store.getRates(),
+        store.listAiMessages(user.id, 16),
+      ]);
+
+      const ratesContext = rates
+        .map(
+          (rt) =>
+            `- ${rt.service_name}: ${rt.is_starting_from ? 'Desde ' : ''}$${rt.base_price.toLocaleString('es-CO')} COP`
+        )
+        .join('\n');
+
+      try {
+        const reply = await askAdminAssistant({
+          message,
+          history: historyRows.map((m) => ({ role: m.role, content: m.content })),
+          requestContext,
+          ratesContext,
+        });
+
+        const now = new Date().toISOString();
+        await store.createAiMessage({
+          id: crypto.randomUUID(),
+          user_id: user.id,
+          role: 'user',
+          context_request_id: requestId,
+          content: message,
+          created_at: now,
+        });
+        await store.createAiMessage({
+          id: crypto.randomUUID(),
+          user_id: user.id,
+          role: 'assistant',
+          context_request_id: requestId,
+          content: reply,
+          created_at: new Date(Date.now() + 5).toISOString(),
+        });
+
+        res.json({ reply });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Error al consultar AulaPro Assistant.';
+        res.status(502).json({ error: msg });
+      }
+    })
+  );
+
+  // Error handler for multer, storage & async route errors
   app.use(
     (
       err: Error,
@@ -2090,9 +2213,9 @@ async function startServer() {
     });
   }
 
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`AulaPro AI server listening on http://0.0.0.0:${PORT}`);
+    console.log(`AulaPro AI server listening on http://0.0.0.0:${PORT} (storage: ${store.mode})`);
   });
 }
 

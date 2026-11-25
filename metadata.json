@@ -1,0 +1,6 @@
+{
+  "name": "AulaPro AI",
+  "description": "Plataforma de servicios y apoyo académico personalizado en Colombia. Tu solución académica, a un clic.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -152,7 +152,7 @@ export function AuthView({
         const res = await apiFetch<{ user: UserProfile }>('/api/auth/admin-setup', {
           method: 'POST',
           body: JSON.stringify({
-            name: name || 'Administrador AulaPro AI',
+            name: name || 'Administrador AulaPro',
             email,
             password,
           }),

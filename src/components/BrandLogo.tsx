@@ -16,7 +16,7 @@ export function BrandLogo({ size = 'md', showText = true }: BrandLogoProps) {
       >
         <img
           src="/assets/aistudio/aula_325d8394.png"
-          alt="Logotipo oficial de AulaPro AI"
+          alt="Logotipo oficial de AulaPro"
           referrerPolicy="no-referrer"
           className="h-full w-full object-contain p-0.5"
         />
@@ -25,8 +25,7 @@ export function BrandLogo({ size = 'md', showText = true }: BrandLogoProps) {
         <span
           className={`${textSize} font-display font-bold tracking-tight text-[#0A1633] dark:text-white`}
         >
-          AulaPro{' '}
-          <span className="text-[#2563EB] dark:text-[#38BDF8]">AI</span>
+          AulaPro
         </span>
       )}
     </div>

@@ -3,13 +3,13 @@ services:
     name: aulapro-ai
     runtime: node
     plan: free
-    buildCommand: npm install && npm run build
-    startCommand: npm start
+    buildCommand: npm install --legacy-peer-deps && npm run build
+    startCommand: node --experimental-strip-types server.ts
     envVars:
       - key: NODE_ENV
         value: production
       - key: NODE_VERSION
-        value: 22.14.0
+        value: "22"
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_ANON_KEY

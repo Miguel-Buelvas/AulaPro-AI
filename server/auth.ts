@@ -211,9 +211,9 @@ export async function syncEnvAdminIfNeeded(): Promise<void> {
     await store.createUser({
       id: crypto.randomUUID(),
       email: envEmail,
-      name: 'Administrador AulaPro AI',
+      name: 'Administrador AulaPro',
       phone: '',
-      institution: 'AulaPro AI',
+      institution: 'AulaPro',
       education_level: 'Administración',
       program: 'Dirección Académica',
       role: 'admin',

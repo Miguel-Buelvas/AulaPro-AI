@@ -11,8 +11,8 @@ export function LegalModal({ docType, onClose }: LegalModalProps) {
   if (!docType) return null;
 
   const titles: Record<LegalDocType, string> = {
-    terms: 'Términos y Condiciones de Servicio — AulaPro AI',
-    privacy: 'Política de Privacidad y Confidencialidad — AulaPro AI',
+    terms: 'Términos y Condiciones de Servicio — AulaPro',
+    privacy: 'Política de Privacidad y Confidencialidad — AulaPro',
     data: 'Política de Tratamiento de Datos Personales (Ley 1581 de 2012)',
   };
 
@@ -45,7 +45,7 @@ export function LegalModal({ docType, onClose }: LegalModalProps) {
           {docType === 'terms' && (
             <>
               <p>
-                <strong>1. Naturaleza del servicio:</strong> AulaPro AI ofrece servicios de apoyo académico, orientación metodológica, tutoría, organización documental y preparación de material de aprendizaje personalizado. Las entregas finales son elaboradas y revisadas directamente por el administrador del negocio.
+                <strong>1. Naturaleza del servicio:</strong> AulaPro ofrece servicios de apoyo académico, orientación metodológica, tutoría, organización documental y preparación de material de aprendizaje personalizado. Las entregas finales son elaboradas y revisadas directamente por el administrador del negocio.
               </p>
               <p>
                 <strong>2. Cotizaciones preliminares y precio definitivo:</strong> El cotizador automático calcula un valor orientativo en pesos colombianos (COP). El precio definitivo siempre es revisado y confirmado personalmente por el administrador según la complejidad, extensión y fecha límite de cada solicitud.
@@ -82,7 +82,7 @@ export function LegalModal({ docType, onClose }: LegalModalProps) {
           {docType === 'data' && (
             <>
               <p>
-                En cumplimiento de la <strong>Ley Estatutaria 1581 de 2012</strong> y el <strong>Decreto 1377 de 2013</strong> de la República de Colombia, AulaPro AI informa a sus usuarios que los datos personales suministrados (nombre completo, correo electrónico, teléfono opcional, institución educativa y programa académico) serán tratados de manera confidencial.
+                En cumplimiento de la <strong>Ley Estatutaria 1581 de 2012</strong> y el <strong>Decreto 1377 de 2013</strong> de la República de Colombia, AulaPro informa a sus usuarios que los datos personales suministrados (nombre completo, correo electrónico, teléfono opcional, institución educativa y programa académico) serán tratados de manera confidencial.
               </p>
               <p>
                 <strong>Finalidad del tratamiento:</strong> Gestionar el registro de la cuenta estudiantil, elaborar cotizaciones académicas, verificar pagos realizados por Nequi, enviar notificaciones sobre el estado de las solicitudes y habilitar la descarga privada de los documentos entregados.
@@ -91,7 +91,7 @@ export function LegalModal({ docType, onClose }: LegalModalProps) {
                 <strong>Derechos del titular (Habeas Data):</strong> Como titular de tus datos personales tienes derecho a conocer, actualizar y rectificar tu información directamente desde la sección «Mi perfil», así como a solicitar la supresión o revocatoria de autorización cuando no exista un deber legal o contractual vigente.
               </p>
               <p>
-                <strong>No comercialización:</strong> AulaPro AI no vende, cede ni comparte tus datos personales o documentos académicos con terceros ajenos a la prestación directa del servicio solicitado.
+                <strong>No comercialización:</strong> AulaPro no vende, cede ni comparte tus datos personales o documentos académicos con terceros ajenos a la prestación directa del servicio solicitado.
               </p>
             </>
           )}

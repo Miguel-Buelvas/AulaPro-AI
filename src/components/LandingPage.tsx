@@ -301,23 +301,20 @@ export function LandingPage({
                     </div>
                   </div>
 
-                  {/* Glowing Laptop Screen Frame showcasing the ORIGINAL AulaPro AI logo */}
+                  {/* Glowing Laptop Screen Frame showcasing the ORIGINAL AulaPro logo */}
                   <div className="sm:col-span-7">
                     <div className="rounded-2xl border-2 border-[#2D4794] bg-[#050816] p-5 shadow-xl">
                       <div className="flex flex-col items-center justify-center text-center py-4">
                         <div className="h-24 w-24 rounded-2xl overflow-hidden bg-[#050816] border border-[#1E293B] p-1">
                           <img
                             src="/assets/aistudio/aula_325d8394.png"
-                            alt="Logotipo oficial de AulaPro AI"
+                            alt="Logotipo oficial de AulaPro"
                             referrerPolicy="no-referrer"
                             className="h-full w-full object-contain"
                           />
                         </div>
                         <p className="mt-3 font-display font-bold text-xl tracking-tight text-white">
-                          AulaPro{' '}
-                          <span className="bg-linear-to-r from-[#38BDF8] to-[#A855F7] bg-clip-text text-transparent">
-                            AI
-                          </span>
+                          AulaPro
                         </p>
                         <p className="mt-1 text-xs text-slate-400">
                           Tu solución académica, a un clic.
@@ -405,7 +402,7 @@ export function LandingPage({
       <section id="proceso" className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-16">
         <div className="max-w-2xl">
           <h2 className="font-display text-2xl sm:text-3xl font-bold text-[#0A1633] dark:text-white">
-            Cómo funciona AulaPro AI
+            Cómo funciona AulaPro
           </h2>
           <p className="mt-2 text-sm sm:text-base text-slate-600 dark:text-slate-300">
             Un proceso transparente de punta a punta para garantizar calidad académica, verificación real de pagos y privacidad documental.
@@ -652,7 +649,7 @@ export function LandingPage({
                     Aún no hay calificaciones publicadas
                   </h3>
                   <p className="text-sm text-slate-600 dark:text-slate-300 max-w-md mx-auto">
-                    En AulaPro AI no mostramos reseñas inventadas. Cuando un estudiante recibe su entrega final, puede calificar de 1 a 5 estrellas desde su cuenta y su opinión verificada aparecerá aquí.
+                    En AulaPro no mostramos reseñas inventadas. Cuando un estudiante recibe su entrega final, puede calificar de 1 a 5 estrellas desde su cuenta y su opinión verificada aparecerá aquí.
                   </p>
                 </div>
               ) : (
@@ -695,7 +692,7 @@ export function LandingPage({
 
                       {rv.adminReply && (
                         <div className="rounded-xl bg-[#0A1633]/5 dark:bg-[#101D42] p-3 text-xs text-slate-600 dark:text-slate-300">
-                          <strong>Respuesta AulaPro AI:</strong> {rv.adminReply}
+                          <strong>Respuesta AulaPro:</strong> {rv.adminReply}
                         </div>
                       )}
                     </div>

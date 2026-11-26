@@ -1328,7 +1328,7 @@ export function StudentDashboard({
                                       {r.nequiNumber}
                                     </p>
                                     <p className="text-xs text-slate-300 mt-0.5">
-                                      Titular: {r.nequiHolder || 'AulaPro AI'}
+                                      Titular: {r.nequiHolder || 'AulaPro'}
                                     </p>
                                   </div>
                                   <button

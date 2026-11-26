@@ -1,4 +1,4 @@
--- AulaPro AI - Esquema PostgreSQL para Supabase
+-- AulaPro - Esquema PostgreSQL para Supabase
 -- Ejecuta este script una sola vez en Supabase -> SQL Editor -> New query
 
 create table if not exists public.users (
@@ -162,7 +162,7 @@ create index if not exists idx_payments_student_id on public.payments(student_id
 create index if not exists idx_notifications_recipient_id on public.notifications(recipient_id);
 create index if not exists idx_ai_messages_user_id on public.ai_messages(user_id);
 
--- Bloqueo RLS: todo el acceso pasa exclusivamente por el servidor autenticado de AulaPro AI
+-- Bloqueo RLS: todo el acceso pasa exclusivamente por el servidor autenticado de AulaPro
 alter table public.users enable row level security;
 alter table public.sessions enable row level security;
 alter table public.catalog_services enable row level security;

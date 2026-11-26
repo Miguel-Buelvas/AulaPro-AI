@@ -187,12 +187,12 @@ export default function App() {
           <div className="h-10 w-10 mx-auto rounded-xl bg-[#050816] overflow-hidden p-1">
             <img
               src="/assets/aistudio/aula_325d8394.png"
-              alt="AulaPro AI"
+              alt="AulaPro"
               className="h-full w-full object-contain"
             />
           </div>
           <p className="text-sm font-medium text-slate-500 dark:text-slate-400">
-            Cargando AulaPro AI...
+            Cargando AulaPro...
           </p>
         </div>
       </div>

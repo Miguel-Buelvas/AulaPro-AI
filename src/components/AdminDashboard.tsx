@@ -136,7 +136,7 @@ export function AdminDashboard({
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [settings, setSettings] = useState<AdminSettingsData>({
     nequiNumber: '3204236962',
-    nequiHolder: 'AulaPro AI',
+    nequiHolder: 'AulaPro',
     paymentInstructions: '',
     officialGatewayStatus: 'pending_config',
     businessEmail: '',
@@ -1614,7 +1614,7 @@ export function AdminDashboard({
                         onChange={(e) =>
                           setReplyDrafts((prev) => ({ ...prev, [rv.id]: e.target.value }))
                         }
-                        placeholder="Escribir respuesta pública de AulaPro AI..."
+                        placeholder="Escribir respuesta pública de AulaPro..."
                         className="flex-1 min-w-56 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-[#F9FAFC] dark:bg-[#060B19] text-xs"
                       />
                       <button

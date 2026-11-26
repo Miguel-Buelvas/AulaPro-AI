@@ -187,7 +187,7 @@ function seedInitialData() {
 
   const settingsDefaults: Record<string, string> = {
     nequi_number: '3204236962',
-    nequi_holder: 'AulaPro AI',
+    nequi_holder: 'AulaPro',
     payment_instructions:
       '1. Copia el número de Nequi autorizado.\n2. Envía el valor exacto aprobado en tu cotización.\n3. Toma una captura o descarga el comprobante con número de referencia visible.\n4. Sube el comprobante en este formulario para verificación manual del administrador.',
     official_gateway_status: 'pending_config',

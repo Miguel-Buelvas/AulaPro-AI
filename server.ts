@@ -216,7 +216,7 @@ async function mapRequestRow(
   if (quoteApproved) {
     const nequi = nequiDefaults ?? {
       nequiNumber: await getSetting('nequi_number', '3204236962'),
-      nequiHolder: await getSetting('nequi_holder', 'AulaPro AI'),
+      nequiHolder: await getSetting('nequi_holder', 'AulaPro'),
       paymentInstructions: await getSetting('payment_instructions', ''),
     };
     base.nequiNumber = nequi.nequiNumber;
@@ -327,7 +327,7 @@ async function startServer() {
         return;
       }
       const email = String(req.body?.email || '').trim().toLowerCase();
-      const name = String(req.body?.name || 'Administrador AulaPro AI').trim();
+      const name = String(req.body?.name || 'Administrador AulaPro').trim();
       const password = String(req.body?.password || '');
 
       if (!email || !email.includes('@')) {
@@ -354,7 +354,7 @@ async function startServer() {
         email,
         name: name.slice(0, 120),
         phone: '',
-        institution: 'AulaPro AI',
+        institution: 'AulaPro',
         education_level: 'Administración',
         program: 'Dirección Académica',
         role: 'admin',
@@ -372,7 +372,7 @@ async function startServer() {
           email,
           name: name.slice(0, 120),
           phone: '',
-          institution: 'AulaPro AI',
+          institution: 'AulaPro',
           educationLevel: 'Administración',
           program: 'Dirección Académica',
           role: 'admin' as const,
@@ -435,14 +435,14 @@ async function startServer() {
 
       await createNotification({
         recipientId: id,
-        title: 'Bienvenido a AulaPro AI',
+        title: 'Bienvenido a AulaPro',
         message: 'Tu cuenta estudiantil ha sido creada. Ya puedes solicitar servicios académicos personalizados.',
         type: 'welcome',
       });
 
       await notifyAdmins({
         title: 'Nuevo estudiante registrado',
-        message: `${name.slice(0, 120)} (${email}) se registró en AulaPro AI.`,
+        message: `${name.slice(0, 120)} (${email}) se registró en AulaPro.`,
         type: 'new_user',
       });
 
@@ -535,14 +535,14 @@ async function startServer() {
 
         await createNotification({
           recipientId: id,
-          title: 'Bienvenido a AulaPro AI',
+          title: 'Bienvenido a AulaPro',
           message: 'Tu cuenta estudiantil fue creada con Google. Ya puedes solicitar servicios académicos personalizados.',
           type: 'welcome',
         });
 
         await notifyAdmins({
           title: 'Nuevo estudiante registrado (Google)',
-          message: `${userRow.name} (${userRow.email}) se registró con Google en AulaPro AI.`,
+          message: `${userRow.name} (${userRow.email}) se registró con Google en AulaPro.`,
           type: 'new_user',
         });
       }
@@ -694,7 +694,7 @@ async function startServer() {
           store.listPayments(isAdmin ? {} : { studentId: user.id }),
           store.listReviews(isAdmin ? undefined : user.id),
           getSetting('nequi_number', '3204236962'),
-          getSetting('nequi_holder', 'AulaPro AI'),
+          getSetting('nequi_holder', 'AulaPro'),
           getSetting('payment_instructions', ''),
         ]);
 
@@ -1873,7 +1873,7 @@ async function startServer() {
         welcomeNote,
       ] = await Promise.all([
         getSetting('nequi_number', '3204236962'),
-        getSetting('nequi_holder', 'AulaPro AI'),
+        getSetting('nequi_holder', 'AulaPro'),
         getSetting('payment_instructions', ''),
         getSetting('official_gateway_status', 'pending_config'),
         getSetting('business_email', ''),
@@ -1999,7 +1999,7 @@ async function startServer() {
       XLSX.utils.book_append_sheet(wb, wsPay, 'Pagos');
 
       const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
-      const filename = `AulaPro_AI_Reporte_${new Date().toISOString().slice(0, 10)}.xlsx`;
+      const filename = `AulaPro_Reporte_${new Date().toISOString().slice(0, 10)}.xlsx`;
       res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
       res.send(buffer);
@@ -2215,11 +2215,11 @@ async function startServer() {
 
   const PORT = Number(process.env.PORT) || 3000;
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`AulaPro AI server listening on http://0.0.0.0:${PORT} (storage: ${store.mode})`);
+    console.log(`AulaPro server listening on http://0.0.0.0:${PORT} (storage: ${store.mode})`);
   });
 }
 
 startServer().catch((err) => {
-  console.error('Failed to start AulaPro AI server:', err);
+  console.error('Failed to start AulaPro server:', err);
   process.exit(1);
 });

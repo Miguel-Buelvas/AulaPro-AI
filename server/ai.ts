@@ -16,6 +16,83 @@ function getClient(): GoogleGenAI {
   });
 }
 
+const PRIMARY_MODEL = 'gemini-4-hydrogen';
+const FALLBACK_MODEL = 'gemini-3.1-flash-lite';
+
+function isTransientError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err || '');
+  return (
+    msg.includes('503') ||
+    msg.includes('UNAVAILABLE') ||
+    msg.includes('high demand') ||
+    msg.includes('500') ||
+    msg.includes('INTERNAL') ||
+    msg.includes('ECONNRESET') ||
+    msg.includes('ETIMEDOUT')
+  );
+}
+
+function formatFriendlyGeminiError(err: unknown): Error {
+  const raw = err instanceof Error ? err.message : String(err || '');
+  if (raw.includes('La clave GEMINI_API_KEY')) {
+    return new Error(raw);
+  }
+  if (raw.includes('503') || raw.includes('UNAVAILABLE') || raw.includes('high demand')) {
+    return new Error(
+      'El servicio de IA presenta alta demanda temporal en este momento. Intenta enviar tu mensaje nuevamente en unos segundos.'
+    );
+  }
+  if (raw.includes('429') || raw.includes('RESOURCE_EXHAUSTED') || raw.includes('quota')) {
+    return new Error(
+      'Se alcanzó temporalmente el límite de consultas del asistente. Espera un momento e intenta de nuevo.'
+    );
+  }
+  if (raw.includes('API_KEY_INVALID') || raw.includes('PERMISSION_DENIED') || raw.includes('403')) {
+    return new Error(
+      'La clave GEMINI_API_KEY del servidor no es válida o fue revocada. Verifica la variable en el servidor.'
+    );
+  }
+  return new Error('No fue posible conectar con el asistente en este momento. Intenta de nuevo.');
+}
+
+async function generateWithRetry(
+  ai: GoogleGenAI,
+  request: {
+    contents: string | { parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> };
+    systemInstruction: string;
+  }
+): Promise<string | undefined> {
+  const attempts: Array<{ model: string; delayMs: number }> = [
+    { model: PRIMARY_MODEL, delayMs: 0 },
+    { model: PRIMARY_MODEL, delayMs: 700 },
+    { model: FALLBACK_MODEL, delayMs: 1200 },
+  ];
+
+  let lastError: unknown;
+  for (const step of attempts) {
+    if (step.delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, step.delayMs));
+    }
+    try {
+      const response = await ai.models.generateContent({
+        model: step.model,
+        contents: request.contents,
+        config: {
+          systemInstruction: request.systemInstruction,
+        },
+      });
+      return response.text;
+    } catch (err) {
+      lastError = err;
+      if (!isTransientError(err)) {
+        throw formatFriendlyGeminiError(err);
+      }
+    }
+  }
+
+  throw formatFriendlyGeminiError(lastError);
+}
+
 export async function askStudentAssistant(params: {
   message: string;
   history: Array<{ role: 'user' | 'assistant'; content: string }>;
@@ -48,15 +125,12 @@ ${params.requestsSummary}`;
     ? `${conversationText}\n\nEstudiante: ${params.message}`
     : `Estudiante: ${params.message}`;
 
-  const response = await ai.models.generateContent({
-    model: 'gemini-4-hydrogen',
+  const text = await generateWithRetry(ai, {
     contents: prompt,
-    config: {
-      systemInstruction,
-    },
+    systemInstruction,
   });
 
-  return response.text?.trim() || 'No fue posible generar una respuesta en este momento.';
+  return text?.trim() || 'No fue posible generar una respuesta en este momento.';
 }
 
 export async function askAdminAssistant(params: {
@@ -171,13 +245,10 @@ ${params.ratesContext}`;
       : `Administrador: ${params.message}`,
   });
 
-  const response = await ai.models.generateContent({
-    model: 'gemini-4-hydrogen',
+  const text = await generateWithRetry(ai, {
     contents: { parts },
-    config: {
-      systemInstruction,
-    },
+    systemInstruction,
   });
 
-  return response.text?.trim() || 'No fue posible analizar la solicitud en este momento.';
+  return text?.trim() || 'No fue posible analizar la solicitud en este momento.';
 }

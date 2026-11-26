@@ -453,6 +453,7 @@ export function AdminDashboard({
     try {
       const res = await apiFetch<{ reply: string }>('/api/ai/admin-analyze', {
         method: 'POST',
+        timeoutMs: 35000,
         body: JSON.stringify({
           message: prompt,
           requestId: aiRequestId || null,

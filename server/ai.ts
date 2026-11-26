@@ -1,4 +1,4 @@
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import { readFileBuffer } from './storage.ts';
 
 function getClient(): GoogleGenAI {
@@ -28,7 +28,8 @@ function isTransientError(err: unknown): boolean {
     msg.includes('500') ||
     msg.includes('INTERNAL') ||
     msg.includes('ECONNRESET') ||
-    msg.includes('ETIMEDOUT')
+    msg.includes('ETIMEDOUT') ||
+    msg.includes('GEMINI_TIMEOUT')
   );
 }
 
@@ -37,7 +38,12 @@ function formatFriendlyGeminiError(err: unknown): Error {
   if (raw.includes('La clave GEMINI_API_KEY')) {
     return new Error(raw);
   }
-  if (raw.includes('503') || raw.includes('UNAVAILABLE') || raw.includes('high demand')) {
+  if (
+    raw.includes('503') ||
+    raw.includes('UNAVAILABLE') ||
+    raw.includes('high demand') ||
+    raw.includes('GEMINI_TIMEOUT')
+  ) {
     return new Error(
       'El servicio de IA presenta alta demanda temporal en este momento. Intenta enviar tu mensaje nuevamente en unos segundos.'
     );
@@ -60,12 +66,13 @@ async function generateWithRetry(
   request: {
     contents: string | { parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> };
     systemInstruction: string;
+    thinkingLevel: ThinkingLevel;
   }
 ): Promise<string | undefined> {
-  const attempts: Array<{ model: string; delayMs: number }> = [
-    { model: PRIMARY_MODEL, delayMs: 0 },
-    { model: PRIMARY_MODEL, delayMs: 700 },
-    { model: FALLBACK_MODEL, delayMs: 1200 },
+  const attempts: Array<{ model: string; delayMs: number; timeoutMs: number }> = [
+    { model: PRIMARY_MODEL, delayMs: 0, timeoutMs: 14000 },
+    { model: FALLBACK_MODEL, delayMs: 350, timeoutMs: 14000 },
+    { model: PRIMARY_MODEL, delayMs: 800, timeoutMs: 16000 },
   ];
 
   let lastError: unknown;
@@ -73,20 +80,36 @@ async function generateWithRetry(
     if (step.delayMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, step.delayMs));
     }
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const response = await ai.models.generateContent({
-        model: step.model,
-        contents: request.contents,
-        config: {
-          systemInstruction: request.systemInstruction,
-        },
-      });
+      const config =
+        step.model === PRIMARY_MODEL
+          ? {
+              systemInstruction: request.systemInstruction,
+              thinkingConfig: { thinkingLevel: request.thinkingLevel },
+            }
+          : {
+              systemInstruction: request.systemInstruction,
+            };
+
+      const response = await Promise.race([
+        ai.models.generateContent({
+          model: step.model,
+          contents: request.contents,
+          config,
+        }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('GEMINI_TIMEOUT')), step.timeoutMs);
+        }),
+      ]);
       return response.text;
     } catch (err) {
       lastError = err;
       if (!isTransientError(err)) {
         throw formatFriendlyGeminiError(err);
       }
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 
@@ -128,6 +151,7 @@ ${params.requestsSummary}`;
   const text = await generateWithRetry(ai, {
     contents: prompt,
     systemInstruction,
+    thinkingLevel: ThinkingLevel.LOW,
   });
 
   return text?.trim() || 'No fue posible generar una respuesta en este momento.';
@@ -248,6 +272,7 @@ ${params.ratesContext}`;
   const text = await generateWithRetry(ai, {
     contents: { parts },
     systemInstruction,
+    thinkingLevel: ThinkingLevel.MEDIUM,
   });
 
   return text?.trim() || 'No fue posible analizar la solicitud en este momento.';

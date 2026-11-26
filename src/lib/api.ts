@@ -1,18 +1,36 @@
 export async function apiFetch<T = unknown>(
   url: string,
-  options: RequestInit = {}
+  options: RequestInit & { timeoutMs?: number } = {}
 ): Promise<T> {
-  const headers = new Headers(options.headers || {});
+  const { timeoutMs, ...fetchOptions } = options;
+  const headers = new Headers(fetchOptions.headers || {});
   headers.set('X-Requested-With', 'AulaPro');
-  if (!(options.body instanceof FormData) && !headers.has('Content-Type')) {
+  if (!(fetchOptions.body instanceof FormData) && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json');
   }
 
-  const response = await fetch(url, {
-    ...options,
-    headers,
-    credentials: 'include',
-  });
+  const controller = timeoutMs ? new AbortController() : null;
+  const timer =
+    controller && timeoutMs
+      ? setTimeout(() => controller.abort(), timeoutMs)
+      : undefined;
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      ...fetchOptions,
+      headers,
+      credentials: 'include',
+      signal: controller ? controller.signal : fetchOptions.signal,
+    });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      throw new Error('La solicitud tardó demasiado en responder. Intenta de nuevo.');
+    }
+    throw err;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 
   const contentType = response.headers.get('content-type') || '';
   if (contentType.includes('application/json')) {

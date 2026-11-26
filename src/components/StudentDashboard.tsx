@@ -394,6 +394,7 @@ export function StudentDashboard({
     try {
       const res = await apiFetch<{ reply: string }>('/api/ai/student-chat', {
         method: 'POST',
+        timeoutMs: 30000,
         body: JSON.stringify({ message: msg }),
       });
       setAiMessages((prev) => [
@@ -1636,8 +1637,9 @@ export function StudentDashboard({
                 {aiMessages.length > 0 && (
                   <button
                     type="button"
+                    disabled={aiSending}
                     onClick={handleClearAi}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs text-slate-600 dark:text-slate-300 hover:text-rose-500"
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs text-slate-600 dark:text-slate-300 hover:text-rose-500 disabled:opacity-50"
                   >
                     <Trash2 className="h-3.5 w-3.5" />
                     <span>Limpiar</span>

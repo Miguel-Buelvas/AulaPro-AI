@@ -12,6 +12,7 @@ import type { LegalDocType } from './LegalModal.tsx';
 
 interface AuthViewProps {
   initialMode: 'login' | 'register' | 'admin-setup';
+  externalError?: string | null;
   adminNeedsSetup: boolean;
   googleAuthConfigured: boolean;
   supabaseConfig: PublicSupabaseConfig | null;
@@ -24,6 +25,7 @@ interface AuthViewProps {
 
 export function AuthView({
   initialMode,
+  externalError = null,
   adminNeedsSetup,
   googleAuthConfigured,
   supabaseConfig,
@@ -49,8 +51,12 @@ export function AuthView({
 
   const [loading, setLoading] = useState(false);
   const [googleLoading, setGoogleLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(externalError);
   const [showGoogleNotice, setShowGoogleNotice] = useState(false);
+
+  useEffect(() => {
+    if (externalError) setError(externalError);
+  }, [externalError]);
 
   useEffect(() => {
     const onMessage = async (event: MessageEvent) => {
@@ -90,6 +96,9 @@ export function AuthView({
           options: {
             redirectTo: window.location.origin,
             skipBrowserRedirect: true,
+            queryParams: {
+              prompt: 'select_account',
+            },
           },
         });
         if (oauthErr || !data?.url) {
@@ -105,6 +114,9 @@ export function AuthView({
           provider: 'google',
           options: {
             redirectTo: window.location.origin,
+            queryParams: {
+              prompt: 'select_account',
+            },
           },
         });
         if (oauthErr) {

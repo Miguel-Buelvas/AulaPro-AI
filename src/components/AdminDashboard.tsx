@@ -547,7 +547,7 @@ export function AdminDashboard({
   return (
     <div className="min-h-screen flex bg-[#F4F6FA] dark:bg-[#060B19] text-[#0A1633] dark:text-[#F1F5F9]">
       {/* Desktop Sidebar */}
-      <aside className="hidden lg:flex lg:w-64 lg:flex-col border-r border-slate-200 dark:border-slate-800 bg-white dark:bg-[#090F22] shrink-0">
+      <aside className="hidden lg:flex lg:w-64 lg:flex-col lg:h-screen lg:sticky lg:top-0 border-r border-slate-200 dark:border-slate-800 bg-white dark:bg-[#090F22] shrink-0">
         <div className="h-16 px-5 flex items-center justify-between border-b border-slate-200 dark:border-slate-800">
           <BrandLogo size="sm" />
           <span className="text-[11px] font-mono text-[#7C3AED] dark:text-violet-400">Admin</span>
@@ -691,6 +691,14 @@ export function AdminDashboard({
               aria-label="Cambiar tema"
             >
               {darkMode ? <Sun className="h-4 w-4 text-amber-400" /> : <Moon className="h-4 w-4 text-[#2563EB]" />}
+            </button>
+            <button
+              type="button"
+              onClick={onLogout}
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-rose-200 dark:border-rose-900/60 text-xs font-semibold text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/30 transition-colors"
+            >
+              <LogOut className="h-3.5 w-3.5" />
+              <span>Cerrar sesión</span>
             </button>
           </div>
         </header>

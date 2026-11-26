@@ -514,6 +514,14 @@ async function startServer() {
       }
 
       let userRow = await store.getUserByEmail(verified.email);
+      if (userRow && userRow.role === 'admin') {
+        res.status(403).json({
+          error:
+            'Por seguridad, la cuenta de administrador debe iniciar sesión con correo y contraseña en «Iniciar sesión». Para entrar como estudiante, selecciona otro correo de Google.',
+        });
+        return;
+      }
+
       if (!userRow) {
         const now = new Date().toISOString();
         const id = crypto.randomUUID();

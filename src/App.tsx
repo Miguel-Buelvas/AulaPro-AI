@@ -90,6 +90,7 @@ export default function App() {
 
   const [view, setView] = useState<'landing' | 'auth' | 'panel'>('landing');
   const [authMode, setAuthMode] = useState<'login' | 'register' | 'admin-setup'>('login');
+  const [authBannerError, setAuthBannerError] = useState<string | null>(null);
   const [preselectedService, setPreselectedService] = useState<string | null>(null);
   const [legalDoc, setLegalDoc] = useState<LegalDocType | null>(null);
 
@@ -142,9 +143,19 @@ export default function App() {
               window.close();
               return;
             }
-            activeUser = await exchangeSupabaseAccessToken(token);
-            await supabase.auth.signOut({ scope: 'local' });
-            window.history.replaceState({}, document.title, window.location.pathname);
+            try {
+              activeUser = await exchangeSupabaseAccessToken(token);
+            } catch (oauthErr) {
+              setAuthBannerError(
+                oauthErr instanceof Error
+                  ? oauthErr.message
+                  : 'No fue posible iniciar sesión con Google.'
+              );
+              setView('auth');
+            } finally {
+              await supabase.auth.signOut({ scope: 'local' }).catch(() => undefined);
+              window.history.replaceState({}, document.title, window.location.pathname);
+            }
           }
         }
       }
@@ -211,6 +222,7 @@ export default function App() {
           onToggleDark={() => setDarkMode((d) => !d)}
           onGoAuth={(mode = 'login', serviceName) => {
             setAuthMode(mode);
+            setAuthBannerError(null);
             setPreselectedService(serviceName || null);
             setView('auth');
           }}
@@ -222,13 +234,18 @@ export default function App() {
       {view === 'auth' && (
         <AuthView
           initialMode={authMode}
+          externalError={authBannerError}
           adminNeedsSetup={adminNeedsSetup}
           googleAuthConfigured={googleAuthConfigured}
           supabaseConfig={supabaseConfig}
           darkMode={darkMode}
           onToggleDark={() => setDarkMode((d) => !d)}
-          onBackHome={() => setView('landing')}
+          onBackHome={() => {
+            setAuthBannerError(null);
+            setView('landing');
+          }}
           onAuthenticated={(authedUser) => {
+            setAuthBannerError(null);
             setUser(authedUser);
             setAdminNeedsSetup(false);
             setView('panel');
